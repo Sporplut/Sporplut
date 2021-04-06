@@ -1,0 +1,5 @@
+function load(directory)
+    loadstring(game:HttpGet('https://system-exodus.com/shared/protondev/'..directory,true))()    
+    return true
+end
+load('Vesteria/vesteria-gui.lua')
