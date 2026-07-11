@@ -60,6 +60,52 @@ local digTimeoutTicks = 500
 local espEnabled = false
 local hopEnabled = false
 local hopTimer = 0
+local hopMinValue = 100000000  -- server-hop threshold: hop if all crystals combined > this
+local hopDelaySeconds = 60     -- server-hop countdown (configurable via slider, 10-180s)
+local noCrystalSellTrigger = 5 -- sell every N seconds when no qualified crystals
+local noCrystalSeconds = 0
+
+-- ═══ CRYSTAL CACHE (fixes GetDescendants stutter on hop/farm loops) ═══
+local _crystalCache = {}        -- {[obj] = true} of all crystal parts in workspace
+local _lastCacheRebuild = -1    -- tick() of last full rebuild (safety net every 30s)
+
+local function isCrystal(obj)
+  if not obj then return false end
+  if not (obj:IsA("MeshPart") or obj:IsA("Part")) then return false end
+  local ok, tier = pcall(function() return obj:GetAttribute("TierName") end)
+  if not ok or not tier then return false end
+  local path = obj:GetFullName()
+  if path:find("Plots") or path:find("PlacedCrystals") then return false end
+  return true
+end
+
+local function rebuildCrystalCache()
+  _crystalCache = {}
+  for _, obj in pairs(workspace:GetDescendants()) do
+    if isCrystal(obj) then _crystalCache[obj] = true end
+  end
+  _lastCacheRebuild = tick()
+end
+
+-- Listen to descendant events to keep cache fresh. pcall'd so a missing event listener doesn't crash.
+pcall(function()
+  workspace.DescendantAdded:Connect(function(obj)
+    if isCrystal(obj) then _crystalCache[obj] = true end
+  end)
+end)
+pcall(function()
+  workspace.DescendantRemoving:Connect(function(obj)
+    _crystalCache[obj] = nil
+  end)
+end)
+
+-- Initial cache build (so first frame after script start can use it)
+rebuildCrystalCache()
+
+-- Safety rebuild trigger (called by main farm/spawn loops every ~30s)
+local function ensureCacheFresh()
+  if tick() - _lastCacheRebuild > 30 then rebuildCrystalCache() end
+end
 local sellOn = false
 local smartSellOn = false
 local antiRagdollEnabled = false
@@ -190,18 +236,18 @@ local function findBestCrystal()
   local maxW, used = getMaxWeight(), getUsedWeight()
   local now = tick()
   for obj, expire in pairs(skippedCrystals) do if now >= expire then skippedCrystals[obj] = nil end end
-  for _, obj in pairs(ws:GetDescendants()) do
-    if (obj:IsA("MeshPart") or obj:IsA("Part")) and obj:GetAttribute("TierName") then
-      local path = obj:GetFullName()
-      if path:find("Plots") or path:find("PlacedCrystals") or skippedCrystals[obj] or failedCrystals[obj] then continue end
+  -- Use cached crystal set instead of GetDescendants (much cheaper at runtime)
+  for obj in pairs(_crystalCache) do
+    if obj and obj.Parent and not skippedCrystals[obj] and not failedCrystals[obj] then
       local tier = obj:GetAttribute("TierName")
       if tier and rarityTogState[tier] then
         local sz = obj:GetAttribute("SizeClass")
         if sz and sizeTogState[tostring(sz)] then
           local weight = tonumber(obj:GetAttribute("WeightKg") or 0) or 0
-          if used + weight > maxW then continue end
-          local s = scoreCrystal(obj)
-          if s > bestScore then bestScore = s; bestCrystal = obj end
+          if used + weight <= maxW then
+            local s = scoreCrystal(obj)
+            if s > bestScore then bestScore = s; bestCrystal = obj end
+          end
         end
       end
     end
@@ -512,8 +558,9 @@ local function updateESP()
   local char = player.Character
   local root = char and char:FindFirstChild("HumanoidRootPart")
   if not root then return end
-  for _, obj in pairs(ws:GetDescendants()) do
-    if (obj:IsA("MeshPart") or obj:IsA("Part")) and obj:GetAttribute("TierName") then
+  -- Use cached crystal set instead of GetDescendants (much cheaper)
+  for obj in pairs(_crystalCache) do
+    if obj and obj.Parent then
       local path = obj:GetFullName()
       if not path:find("Plots") and not path:find("PlacedCrystals") then
         local tier = obj:GetAttribute("TierName") or "?"
@@ -548,6 +595,208 @@ local function updateESP()
 end
 
 -- MAIN FARM LOOP
+-- Extracted dig block — keeps register pressure manageable in farmLoop itself.
+-- Returns "mined" | "broken" | "full" | "gone" | "continue" string describing outcome.
+local function performDig(targetCrystal, targetTier, targetSize)
+  local char = player.Character
+  local root = char and char:FindFirstChild("HumanoidRootPart")
+  if not root then return "continue" end
+  -- Direct TP to crystal position (no ground snap) — bypasses barriers, gates, walls
+  local digPos = targetCrystal.Position + Vector3.new(0, 2, 0)
+  root.CFrame = CFrame.new(digPos)
+  root.Velocity = Vector3.new(0,0,0)
+  wait(0.5)
+  if not root or not root.Parent or not root:IsDescendantOf(workspace) then
+    return "continue"
+  end
+  local tpDist = (root.Position - digPos).Magnitude
+  if tpDist > 100 then
+    statusText = "Region not loaded — skip 60s"
+    skippedCrystals[targetCrystal] = tick() + 60
+    return "continue"
+  end
+  root.CFrame = CFrame.new(digPos); root.Velocity = Vector3.new(0,0,0)
+
+  statusText = "Digging "..targetTier
+  local holdPos = true
+  local digBroken = false
+  local digBrokenReason = ""
+  local digDone = false
+  spawn(function()
+    while holdPos and root and root.Parent do
+      if not root or not root:IsDescendantOf(workspace) then
+        digBroken = true; digBrokenReason = "Character gone"
+        break
+      end
+      local d = (root.Position - digPos).Magnitude
+      if d > 100 then
+        digBroken = true; digBrokenReason = "Region unload mid-dig"
+        break
+      end
+      if d > 3 then
+        root.CFrame = CFrame.new(digPos)
+        root.Velocity = Vector3.new(0,0,0)
+      end
+      wait(0.15)
+    end
+  end)
+  if CrystalMinePrompt then pcall(function() CrystalMinePrompt:FireServer(targetCrystal) end) end
+  if CrystalHoldComplete then pcall(function() CrystalHoldComplete:FireServer(targetCrystal) end) end
+  if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(targetCrystal) end) end end
+  local lastMinedHP = targetCrystal:GetAttribute("MinedHP")
+  if type(lastMinedHP) ~= "number" then lastMinedHP = 99999 end
+  local noChangeTick, dug = 0, false
+  local crystalGone = false
+  local lastProgressTime = tick()
+  local sizeKey = targetCrystal:GetAttribute("SizeClass") or ""
+  local sizeMult = 1
+  if sizeKey == "Titan" then sizeMult = 3
+  elseif sizeKey == "Leviathan" or sizeKey == "Colossal" then sizeMult = 2.5
+  elseif sizeKey == "Giant" then sizeMult = 2
+  elseif sizeKey == "XL" then sizeMult = 1.5
+  elseif sizeKey == "Large" or sizeKey == "L" then sizeMult = 1.2
+  end
+  local scaledTimeout = math.floor(digTimeoutTicks * sizeMult)
+  local HARD_MAX_TICKS = math.floor(75 / 0.15)
+  local maxTicks = math.min(1500, math.max(scaledTimeout + 30, HARD_MAX_TICKS))
+  local PROCESS_TIMEOUT = (scaledTimeout + 30) * 0.15 + 15
+  for tickN = 1, maxTicks do
+    wait(0.15)
+    if not farming then break end
+    char = player.Character
+    root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not root or not root.Parent or not root:IsDescendantOf(workspace) then
+      digBroken = true; digBrokenReason = "Character reset"
+      break
+    end
+    if getUsedWeight() >= getMaxWeight() then dug = true; break end
+    if not targetCrystal or not targetCrystal.Parent then
+      crystalGone = true; dug = true; break
+    end
+    local hp = targetCrystal:GetAttribute("MinedHP")
+    if type(hp) == "number" and hp < lastMinedHP and hp > 0 then
+      lastMinedHP = hp
+      noChangeTick = 0
+      lastProgressTime = tick()
+    end
+    if type(hp) == "number" and hp <= 0 then
+      dug = true
+      digDone = true
+      break
+    end
+    noChangeTick = noChangeTick + 1
+    if tick() - lastProgressTime > PROCESS_TIMEOUT then
+      digBroken = true
+      digBrokenReason = "No progress for "..math.floor(PROCESS_TIMEOUT).."s (HP never decreased)"
+      break
+    end
+    if tickN % 10 == 0 then
+      if type(hp) == "number" then
+        statusText = "Digging "..targetTier.." (HP "..math.floor(hp)..")"
+      else
+        statusText = "Digging "..targetTier.." (waiting for server)"
+      end
+    end
+    if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(targetCrystal) end) end end
+    if CrystalMinePrompt then pcall(function() CrystalMinePrompt:FireServer(targetCrystal) end) end
+    if CrystalHoldComplete then pcall(function() CrystalHoldComplete:FireServer(targetCrystal) end) end
+  end
+  holdPos = false
+  if digBroken then
+    statusText = "Dig broken: "..(digBrokenReason or "unknown").." — skip 90s"
+    print("[Hub] Dig broken: "..(digBrokenReason or "?"))
+    failedCount[targetCrystal] = (failedCount[targetCrystal] or 0) + 1
+    if failedCount[targetCrystal] >= 3 then
+      failedCrystals[targetCrystal] = true
+    else
+      skippedCrystals[targetCrystal] = tick() + 90
+    end
+    pcall(function()
+      char = player.Character
+      local rc = char and char:FindFirstChild("HumanoidRootPart")
+      if rc and targetCrystal and targetCrystal.Parent then
+        rc.CFrame = CFrame.new(targetCrystal.Position + Vector3.new(0, 4, 0))
+        rc.Velocity = Vector3.new(0, 0, 0)
+      else
+        pcall(function() player:LoadCharacter() end)
+      end
+    end)
+    wait(0.5)
+    highlightBox.Visible = false
+    return "broken"
+  end
+  if dug then
+    statsCrystals = statsCrystals + 1
+    statsValue = statsValue + scoreCrystal(targetCrystal)
+    highlightBox.Visible = false
+    if crystalGone then return "gone"
+    elseif digDone then return "mined"
+    else return "full" end
+  end
+  -- Timeout exit
+  statusText = "Dig timeout — skip 60s"
+  failedCount[targetCrystal] = (failedCount[targetCrystal] or 0) + 1
+  if failedCount[targetCrystal] >= 3 then
+    failedCrystals[targetCrystal] = true
+  elseif failedCount[targetCrystal] == 2 then
+    skippedCrystals[targetCrystal] = tick() + 60
+  else
+    skippedCrystals[targetCrystal] = tick() + 15
+  end
+  highlightBox.Visible = false
+  return "continue"
+end
+
+-- ═══ Smart-sell helper (extracted to keep farmLoop register pressure low) ═══
+local function trySmartSell(currentCrystal)
+  if not smartSellOn then return currentCrystal end
+  local targetWeight = tonumber(currentCrystal:GetAttribute("WeightKg") or 0) or 0
+  local targetValue = scoreCrystal(currentCrystal)
+  local used = getUsedWeight()
+  local max = getMaxWeight()
+  if used + targetWeight <= max then return currentCrystal end
+  local bp = player:FindFirstChild("Backpack")
+  if not bp then return currentCrystal end
+
+  local targetEfficiency = targetValue / math.max(targetWeight, 0.001)
+  local held = {}
+  for _, t in pairs(bp:GetChildren()) do
+    if t:IsA("Tool") then
+      local v = tonumber(t:GetAttribute("Value")) or 0
+      local w = tonumber(t:GetAttribute("WeightKg")) or 0
+      held[#held+1] = { tool = t, value = v, weight = w, eff = v / math.max(w, 0.001) }
+    end
+  end
+  table.sort(held, function(a, b) return a.eff < b.eff end)
+
+  local freedWeight = 0
+  local toSell = {}
+  for _, item in ipairs(held) do
+    if used - freedWeight + targetWeight <= max then break end
+    if item.eff >= targetEfficiency then break end
+    toSell[#toSell+1] = item.tool
+    freedWeight = freedWeight + item.weight
+  end
+  if #toSell == 0 then return currentCrystal end
+
+  -- Sanity: target value alone must exceed sum of dropped values
+  local droppedValue = 0
+  for _, item in ipairs(held) do
+    for _, sold in ipairs(toSell) do
+      if item.tool == sold then droppedValue = droppedValue + item.value end
+    end
+  end
+  if targetValue <= droppedValue then return currentCrystal end
+
+  statusText = "Smart sell " .. #toSell .. " (target $"..fmtPrice(targetValue)..")"
+  doSell()
+  wait(0.25)
+  -- Re-evaluate now that there's room
+  local newCrystal = findBestCrystal()
+  if newCrystal then return newCrystal end
+  return currentCrystal
+end
+
 local function farmLoop()
   while farming do
     local char = player.Character
@@ -566,86 +815,31 @@ local function farmLoop()
       else statusText = "Backpack full"; wait(0.5) end
       continue
     end
+    ensureCacheFresh()
     local crystal = findBestCrystal()
     if not crystal then
       noCrystalTimer = noCrystalTimer + 0.5
+      noCrystalSeconds = noCrystalSeconds + 0.5
+      -- Sell whatever we have every few seconds so we never sit on inventory while idle
+      if noCrystalSeconds >= noCrystalSellTrigger and sellOn and getUsedWeight() > 0 then
+        statusText = "Idle — selling"
+        doSell()
+        noCrystalSeconds = 0
+      end
       if noCrystalTimer >= 20 then
-        if sellOn and getUsedWeight() > 0 then doSell() end
         noCrystalTimer = 0; continue
       end
       statusText = "No qualified crystals"; wait(0.5); continue
     end
     noCrystalTimer = 0
+    noCrystalSeconds = 0
     local tier = crystal:GetAttribute("TierName") or "?"
     local sz = crystal:GetAttribute("SizeClass") or "?"
 
-    -- Smart auto sell: drop only items that have LOWER value/weight than the new target
-    -- before mining the target, so we always net-gain value per weight
-    if smartSellOn then
-      local targetWeight = tonumber(crystal:GetAttribute("WeightKg") or 0) or 0
-      local targetValue = scoreCrystal(crystal)
-      local used = getUsedWeight()
-      local max = getMaxWeight()
-      if used + targetWeight > max then
-        local bp = player:FindFirstChild("Backpack")
-        if bp then
-          -- Compute target value-per-weight efficiency
-          local targetEfficiency = targetValue / math.max(targetWeight, 0.001)
-
-          -- Collect all held items with their value/weight ratio
-          local held = {}
-          for _, t in pairs(bp:GetChildren()) do
-            if t:IsA("Tool") then
-              local v = tonumber(t:GetAttribute("Value")) or 0
-              local w = tonumber(t:GetAttribute("WeightKg")) or 0
-              held[#held+1] = {
-                tool = t,
-                value = v,
-                weight = w,
-                eff = v / math.max(w, 0.001)
-              }
-            end
-          end
-
-          -- Sort by efficiency ascending: lowest value/weight first = drop weakest items first
-          table.sort(held, function(a, b) return a.eff < b.eff end)
-
-          -- Drop items ONLY if their efficiency is worse than the target's efficiency.
-          -- Keep dropping until we either have enough room for the target, OR all remaining held items are better than target.
-          local freedWeight = 0
-          local toSell = {}
-          local bestVsSold = false
-          for _, item in ipairs(held) do
-            if used - freedWeight + targetWeight <= max then break end
-            -- Skip items that are better value-per-weight than target (don't drop those)
-            if item.eff >= targetEfficiency then
-              -- remaining items are all >= target; stopping here means the swap isn't profitable
-              break
-            end
-            toSell[#toSell+1] = item.tool
-            freedWeight = freedWeight + item.weight
-            bestVsSold = true
-          end
-          if bestVsSold and #toSell > 0 then
-            -- Sanity check: ensure target's VALUE alone is >= sum of dropped items' values (else no net gain)
-            local droppedValue = 0
-            for _, item in ipairs(held) do
-              for _, sold in ipairs(toSell) do
-                if item.tool == sold then droppedValue = droppedValue + item.value end
-              end
-            end
-            if targetValue > droppedValue then
-              statusText = "Smart sell " .. #toSell .. " (target $"..fmtPrice(targetValue)..")"
-              doSell()
-              wait(0.25)
-              -- Re-evaluate targets now that we have room
-              local newCrystal = findBestCrystal()
-              if newCrystal then crystal = newCrystal end
-            end
-          end
-        end
-      end
-    end
+    -- Smart-sell: encapsulated in trySmartSell (returns possibly-updated crystal)
+    crystal = trySmartSell(crystal) or crystal
+    tier = crystal:GetAttribute("TierName") or "?"
+    sz = crystal:GetAttribute("SizeClass") or "?"
 
     if autoBombEnabled then
       local bombId = autoBombConfig[tier]
@@ -669,139 +863,9 @@ local function farmLoop()
 
     statusText = "Moving to "..tier.." ("..sz..")"
     highlightBox.Adornee = crystal; highlightBox.Visible = true
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then highlightBox.Visible = false; wait(1); continue end
-    -- Direct TP to crystal position (no ground snap) — bypasses barriers, gates, walls
-    local digPos = crystal.Position + Vector3.new(0, 2, 0)
-    root.CFrame = CFrame.new(digPos)
-    root.Velocity = Vector3.new(0,0,0)
-    wait(0.5)
-    -- Verify teleport actually took: if character didn't move close to digPos, region is likely unloaded/slow-streaming — skip with long timeout
-    if not root or not root.Parent or not root:IsDescendantOf(workspace) then
-      highlightBox.Visible = false; continue
-    end
-    local tpDist = (root.Position - digPos).Magnitude
-    if tpDist > 100 then
-      statusText = "Region not loaded — skip 60s"
-      skippedCrystals[crystal] = tick() + 60
-      highlightBox.Visible = false; continue
-    end
-    -- Snap to exact digPos if landed nearby (server sometimes nudges by a few studs)
-    root.CFrame = CFrame.new(digPos); root.Velocity = Vector3.new(0,0,0)
-    statusText = "Digging "..tier
-    local holdPos = true
-    local digBroken = false
-    local digBrokenReason = ""
-    spawn(function()
-      while holdPos and root and root.Parent do
-        if not root or not root:IsDescendantOf(workspace) then
-          digBroken = true; digBrokenReason = "Character gone"
-          break
-        end
-        local d = (root.Position - digPos).Magnitude
-        if d > 100 then
-          digBroken = true; digBrokenReason = "Region unload mid-dig"
-          break
-        end
-        if d > 3 then
-          root.CFrame = CFrame.new(digPos)
-          root.Velocity = Vector3.new(0,0,0)
-        end
-        wait(0.15)
-      end
-    end)
-    if CrystalMinePrompt then pcall(function() CrystalMinePrompt:FireServer(crystal) end) end
-    if CrystalHoldComplete then pcall(function() CrystalHoldComplete:FireServer(crystal) end) end
-    if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(crystal) end) end end
-    local lastMinedHP = crystal:GetAttribute("MinedHP") or 0
-    local noChangeTick, dug = 0, false
-    local crystalGone = false
-    -- Scale timeout by crystal size: bigger crystals need way more hits
-    local sizeKey = crystal:GetAttribute("SizeClass") or ""
-    local sizeMult = 1
-    if sizeKey == "Titan" then sizeMult = 3
-    elseif sizeKey == "Leviathan" or sizeKey == "Colossal" then sizeMult = 2.5
-    elseif sizeKey == "Giant" then sizeMult = 2
-    elseif sizeKey == "XL" then sizeMult = 1.5
-    elseif sizeKey == "Large" or sizeKey == "L" then sizeMult = 1.2
-    end
-    local scaledTimeout = math.floor(digTimeoutTicks * sizeMult)
-    -- HARD CEILING: never let a single dig session run longer than 75 seconds regardless of size
-    local HARD_MAX_TICKS = math.floor(75 / 0.15)
-    local maxTicks = math.min(1500, math.max(scaledTimeout + 30, HARD_MAX_TICKS))
-    for tick = 1, maxTicks do
-      wait(0.15)
-      if not farming then break end
-      -- CHARACTER BROKEN: player died or character reset
-      char = player.Character
-      root = char and char:FindFirstChild("HumanoidRootPart")
-      if not char or not root or not root.Parent or not root:IsDescendantOf(workspace) then
-        digBroken = true; digBrokenReason = "Character reset"
-        break
-      end
-      -- BACKPACK FULL: skip the rest of the dig
-      if getUsedWeight() >= getMaxWeight() then dug = true; break end
-      -- CRYSTAL DISAPPEARED: count as success (someone else got it / despawned)
-      if not crystal or not crystal.Parent or crystal.Parent == nil then
-        crystalGone = true; dug = true; break
-      end
-      local hp = crystal:GetAttribute("MinedHP")
-      if hp ~= nil and hp < lastMinedHP then
-        lastMinedHP = hp
-        noChangeTick = 0
-      end
-      if hp ~= nil and hp <= 0 then dug = true; break end
-      noChangeTick = noChangeTick + 1
-      if noChangeTick > scaledTimeout then break end
-      -- Mid-dig stuck sanity: if we've been at the dig pos for ages with zero progress AND we're actually still near the crystal, it's a legit slow dig; just keep firing
-      if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(crystal) end) end end
-      if CrystalHoldComplete then pcall(function() CrystalHoldComplete:FireServer(crystal) end) end
-    end
-    holdPos = false
-    -- If digBroken fired, force-respawn + skip this crystal for a long timeout
-    if digBroken then
-      statusText = "Dig broken ("..(digBrokenReason or "?")..") — recovering..."
-      -- Record this crystal as doomed for this session so we don't retry it instantly
-      failedCount[crystal] = (failedCount[crystal] or 0) + 1
-      if failedCount[crystal] >= 3 then
-        failedCrystals[crystal] = true
-      else
-        skippedCrystals[crystal] = tick() + 90
-      end
-      -- Try to recover by snapping back near the world origin or last crystal positions area;
-      -- best-effort safety net: if character is broken, attempt respawn; else snap character back to the crystal pos again
-      pcall(function()
-        char = player.Character
-        local rc = char and char:FindFirstChild("HumanoidRootPart")
-        if rc and crystal and crystal.Parent and crystal:IsA("BasePart") then
-          rc.CFrame = CFrame.new(crystal.Position + Vector3.new(0, 4, 0))
-          rc.Velocity = Vector3.new(0, 0, 0)
-          statusText = "Snapping back to crystal"
-        else
-          -- Last resort: respawn the character so the next loop recovers cleanly
-          if player.Health then wait(1) else player:LoadCharacter() end
-        end
-      end)
-      wait(0.5)
-      highlightBox.Visible = false
-      continue
-    end
-    if dug then
-      statsCrystals = statsCrystals + 1
-      statsValue = statsValue + scoreCrystal(crystal)
-      if crystalGone then statusText = "Crystal gone — counted" end
-    else
-      failedCount[crystal] = (failedCount[crystal] or 0) + 1
-      if failedCount[crystal] >= 3 then
-        failedCrystals[crystal] = true
-      elseif failedCount[crystal] == 2 then
-        skippedCrystals[crystal] = tick() + 60
-      else
-        skippedCrystals[crystal] = tick() + 15
-      end
-    end
-    highlightBox.Visible = false
+    -- Extracted dig into a separate function to avoid register overflow in farmLoop
+    performDig(crystal, tier, sz)
+    -- After dig, just continue to next iteration (highlightBox cleanup is inside performDig)
   end
 end
 
@@ -979,6 +1043,7 @@ verTxt.Parent = verPill
 local minimized = false
 local fullHeight = 380
 local headerHeight = 36
+local minimizedPill = nil  -- set after resize grip block (forward reference)
 
 local minBtn = Instance.new("TextButton")
 minBtn.Size = UDim2.new(0, 24, 0, 24)
@@ -1036,21 +1101,56 @@ closeX2.Parent = closeBtn
 
 closeBtn.Activated:Connect(function() farming = false; gui:Destroy() end)
 
-minBtn.Activated:Connect(function()
-  minimized = not minimized
-  if minimized then
-    tw:Create(main, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.new(0, 480, 0, headerHeight)}):Play()
-    if sidebar then sidebar.Visible = false end
-    if contentArea then contentArea.Visible = false end
-    tw:Create(minLineV, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.new(0, 1.6, 0, 9), Position = UDim2.new(0.5, -0.8, 0.5, -4)}):Play()
-  else
-    tw:Create(main, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.new(0, 480, 0, fullHeight)}):Play()
-    delay(0.15, function()
-      if sidebar then sidebar.Visible = true end
-      if contentArea then contentArea.Visible = true end
-    end)
-    tw:Create(minLineV, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size = UDim2.new(0, 1.6, 0, 0), Position = UDim2.new(0.5, -0.8, 0.5, -4)}):Play()
+local function doMinimize()
+  if minimized then return end
+  minimized = true
+  savedMainPos = main.Position
+
+  -- Shrink main to nothing visually, then hide it entirely
+  tw:Create(main, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+    Size = UDim2.new(0, 480, 0, 0),
+    BackgroundTransparency = 1
+  }):Play()
+  delay(0.18, function() main.Visible = false end)
+
+  -- Show floating pill at saved position (top-left of original main)
+  if minimizedPill then
+    -- Pill anchored to wherever main's top-left corner is
+    minimizedPill.Position = UDim2.new(0, savedMainPos.X.Offset, 0, savedMainPos.Y.Offset)
+    minimizedPill.BackgroundTransparency = 1
+    minimizedPill.Visible = true
+    -- Fade-in tween for pill
+    tw:Create(minimizedPill, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
   end
+end
+
+local function doRestore()
+  if not minimized then return end
+  minimized = false
+
+  -- Hide floating pill
+  if minimizedPill then
+    tw:Create(minimizedPill, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {BackgroundTransparency = 1}):Play()
+    delay(0.15, function() minimizedPill.Visible = false end)
+  end
+
+  -- Show main back at saved position
+  main.Position = savedMainPos
+  main.Size = UDim2.new(0, 480, 0, fullHeight)
+  main.BackgroundTransparency = 1
+  main.Visible = true
+  tw:Create(main, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+    Size = UDim2.new(0, 480, 0, fullHeight),
+    BackgroundTransparency = 0
+  }):Play()
+  delay(0.2, function()
+    if sidebar then sidebar.Visible = true end
+    if contentArea then contentArea.Visible = true end
+  end)
+end
+
+minBtn.Activated:Connect(function()
+  if minimized then doRestore() else doMinimize() end
 end)
 
 -- ═══ CUSTOM DRAG (header-based) ═══
@@ -1168,6 +1268,119 @@ do
       local showGrip = not minimized
       for _, g in ipairs(gripParts) do
         if g and g.Parent then g.Visible = showGrip end
+      end
+    end
+  end)
+end
+
+-- ═══ MINIMIZED PILL (gold M + dark text pill, draggable, tap to restore) ═══
+do
+  local pill = Instance.new("TextButton")
+  pill.Name = "MinimizedPill"
+  pill.Size = UDim2.new(0, 240, 0, 52)
+  pill.BackgroundColor3 = SIDEBAR
+  pill.BorderSizePixel = 0
+  pill.Text = ""
+  pill.AutoButtonColor = false
+  pill.Active = true
+  pill.ZIndex = 100
+  pill.Visible = false
+  pill.Parent = gui
+  corner(pill, 26)  -- full pill rounding
+
+  -- Gold M-square on the LEFT
+  local mSquare = Instance.new("Frame")
+  mSquare.Name = "MSquare"
+  mSquare.Size = UDim2.new(0, 40, 0, 40)
+  mSquare.Position = UDim2.new(0, 6, 0.5, -20)
+  mSquare.BackgroundColor3 = ACCENT
+  mSquare.BorderSizePixel = 0
+  mSquare.ZIndex = 101
+  mSquare.Parent = pill
+  corner(mSquare, 10)
+
+  local mLetter = Instance.new("TextLabel")
+  mLetter.Size = UDim2.new(1, 0, 1, 0)
+  mLetter.BackgroundTransparency = 1
+  mLetter.Text = "M"
+  mLetter.TextColor3 = Color3.fromRGB(17, 17, 24)
+  mLetter.TextSize = 22
+  mLetter.Font = FB
+  mLetter.TextYAlignment = Enum.TextYAlignment.Center
+  mLetter.ZIndex = 102
+  mLetter.Parent = mSquare
+
+  -- Hub name on the right of M
+  local hubName = Instance.new("TextLabel")
+  hubName.Size = UDim2.new(0, 184, 0, 20)
+  hubName.Position = UDim2.new(0, 52, 0, 6)
+  hubName.BackgroundTransparency = 1
+  hubName.Text = "Sporplut's Hub"
+  hubName.TextColor3 = TXT
+  hubName.TextSize = 14
+  hubName.Font = FB
+  hubName.TextXAlignment = Enum.TextXAlignment.Left
+  hubName.TextYAlignment = Enum.TextYAlignment.Center
+  hubName.ZIndex = 101
+  hubName.Parent = pill
+
+  local hubSub = Instance.new("TextLabel")
+  hubSub.Size = UDim2.new(0, 184, 0, 14)
+  hubSub.Position = UDim2.new(0, 52, 0, 28)
+  hubSub.BackgroundTransparency = 1
+  hubSub.Text = "by Sporplut"
+  hubSub.TextColor3 = TXTMUTE
+  hubSub.TextSize = 11
+  hubSub.Font = FR
+  hubSub.TextXAlignment = Enum.TextXAlignment.Left
+  hubSub.TextYAlignment = Enum.TextYAlignment.Center
+  hubSub.ZIndex = 101
+  hubSub.Parent = pill
+
+  -- Expose pill to outer scope so doMinimize/doRestore can use it
+  minimizedPill = pill
+end
+
+-- ═══ PILL DRAG + TAP handlers (input on the floating pill) ═══
+do
+  local dragging = false
+  local lastInputPos = nil
+  local dragDistance = 0
+  local wasDragged = false
+  local DRAG_THRESHOLD = 8
+
+  minimizedPill.InputBegan:Connect(function(input)
+    if not minimized then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+      dragging = true
+      lastInputPos = input.Position
+      dragDistance = 0
+      wasDragged = false
+    end
+  end)
+
+  uis.InputChanged:Connect(function(input)
+    if not dragging or not minimized then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if lastInputPos then
+      local delta = Vector2.new(input.Position.X - lastInputPos.X, input.Position.Y - lastInputPos.Y)
+      dragDistance = dragDistance + delta.Magnitude
+      if dragDistance > DRAG_THRESHOLD then wasDragged = true end
+      -- Move pill, clamped to viewport
+      local vs = workspace.CurrentCamera.ViewportSize
+      local newX = math.clamp(minimizedPill.Position.X.Offset + delta.X, 0, vs.X - minimizedPill.Size.X.Offset)
+      local newY = math.clamp(minimizedPill.Position.Y.Offset + delta.Y, 0, vs.Y - minimizedPill.Size.Y.Offset)
+      minimizedPill.Position = UDim2.new(0, newX, 0, newY)
+      lastInputPos = input.Position
+    end
+  end)
+
+  uis.InputEnded:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if dragging then
+      dragging = false
+      if not wasDragged and minimized then
+        doRestore()
       end
     end
   end)
@@ -1694,7 +1907,7 @@ local function cycleRow(parent, label, sub, values, defaultIdx, order, callback)
   return dropdownRow(parent, label, sub, values, defaultIdx, order, callback)
 end
 
-local function sliderRow(parent, label, sub, min, max, default, order, callback)
+local function sliderRow(parent, label, sub, min, max, default, order, callback, unit)
   local f = Instance.new("Frame")
   f.Size = UDim2.new(1, 0, 0, 60); f.BackgroundColor3 = CARD
   f.BorderSizePixel = 0; f.LayoutOrder = order or 0; f.ZIndex = 4; f.Parent = parent
@@ -1713,8 +1926,8 @@ local function sliderRow(parent, label, sub, min, max, default, order, callback)
   end
 
   local valLbl = Instance.new("TextLabel")
-  valLbl.Size = UDim2.new(0, 40, 0, 16); valLbl.Position = UDim2.new(1, -52, 0, 6)
-  valLbl.BackgroundTransparency = 1; valLbl.Text = tostring(default); valLbl.TextColor3 = ACCENT; valLbl.TextSize = 12; valLbl.Font = FC
+  valLbl.Size = UDim2.new(0, 50, 0, 16); valLbl.Position = UDim2.new(1, -62, 0, 6)
+  valLbl.BackgroundTransparency = 1; valLbl.Text = tostring(default) .. (unit or ""); valLbl.TextColor3 = ACCENT; valLbl.TextSize = 12; valLbl.Font = FC
   valLbl.TextXAlignment = Enum.TextXAlignment.Right; valLbl.TextYAlignment = Enum.TextYAlignment.Center; valLbl.ZIndex = 5; valLbl.Parent = f
 
   local track = Instance.new("Frame")
@@ -1741,7 +1954,7 @@ local function sliderRow(parent, label, sub, min, max, default, order, callback)
     curVal = math.floor(min + rel * (max - min))
     fill.Size = UDim2.new(rel, 0, 1, 0)
     knob.Position = UDim2.new(rel, -7, 0.5, -7)
-    valLbl.Text = tostring(curVal)
+    valLbl.Text = tostring(curVal) .. (unit or "")
     if callback then callback(curVal) end
   end
 
@@ -1772,7 +1985,7 @@ local function sliderRow(parent, label, sub, min, max, default, order, callback)
 
   return {
     get = function() return curVal end,
-    set = function(v) curVal = v; local rel = (v - min)/(max - min); fill.Size = UDim2.new(rel,0,1,0); knob.Position = UDim2.new(rel,-7,0.5,-7); valLbl.Text = tostring(v) end,
+    set = function(v) curVal = v; local rel = (v - min)/(max - min); fill.Size = UDim2.new(rel,0,1,0); knob.Position = UDim2.new(rel,-7,0.5,-7); valLbl.Text = tostring(v) .. (unit or "") end,
   }
 end
 
@@ -2032,10 +2245,18 @@ cardHeader(setCard, "SETTINGS", 1)
 sliderRow(setCard, "Dig Timeout", "Skip crystal if no HP change (seconds)", 10, 40, 30, 2, function(val)
   digTimeoutTicks = math.floor(val / 0.15)
 end)
-local hopRow = toggleRow(setCard, "Server Hop", "Hop after 5min with no crystals", false, 3, function(v)
+local hopRow = toggleRow(setCard, "Server Hop", "Hop after delay-seconds of low values", false, 3, function(v)
   hopEnabled = v; hopTimer = 0
   if v then print("[Hub] Server hop ON") else print("[Hub] Server hop OFF") end
 end)
+-- Smart server-hop: slider for minimum qualifying value (in millions, with "M" suffix)
+sliderRow(setCard, "Hop Min Value", "Hop if all visible crystals combined < this", 1, 1000, 100, 4, function(val)
+  hopMinValue = math.floor(val * 1e6)
+end, "M")
+-- Server-hop countdown delay (seconds). User controls how long to wait before hopping.
+sliderRow(setCard, "Hop Delay", "Seconds to wait before teleporting (10-180)", 10, 180, 60, 5, function(val)
+  hopDelaySeconds = math.floor(val)
+end, "s")
 
 -- ═══ Background loops ═══
 spawn(function()
@@ -2056,11 +2277,30 @@ spawn(function()
   while gui and gui.Parent do
     wait(1)
     if hopEnabled and farming then
+      ensureCacheFresh()  -- periodic full rebuild safety net
+
+      -- Compute total value of all visible crystals on this server using CACHE (no full GetDescendants)
+      local totalValue = 0
+      for obj in pairs(_crystalCache) do
+        if obj and obj.Parent then
+          local tier = obj:GetAttribute("TierName")
+          if tier and rarityTogState[tier] then
+            local sz = obj:GetAttribute("SizeClass")
+            if sz and sizeTogState[tostring(sz)] then
+              totalValue = totalValue + (tonumber(obj:GetAttribute("Value")) or 0)
+            end
+          end
+        end
+      end
+      -- If total value is below user's threshold OR no crystals, consider hopping
       local crystal = findBestCrystal()
-      if crystal then hopTimer = 0
+      if crystal and totalValue >= hopMinValue then
+        hopTimer = 0
       else
         hopTimer = hopTimer + 1
-        if hopTimer >= 300 then
+        if hopTimer >= hopDelaySeconds then
+          statusText = "Hopping server (low value $"..fmtPrice(totalValue)..")"
+          print("[Hub] Server-hop: total value $"..fmtPrice(totalValue).." below $"..fmtPrice(hopMinValue))
           local TeleportService = game:GetService("TeleportService")
           local HttpService = game:GetService("HttpService")
           local ok, servers = pcall(function()
