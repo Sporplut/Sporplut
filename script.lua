@@ -263,10 +263,11 @@ local function doSell()
     root.CFrame = CFrame.new(area + Vector3.new(0, 3, 0))
     root.Velocity = Vector3.new(0,0,0)
   else
-    root.CFrame = CFrame.new(sp.Position + Vector3.new(0, 0, 2))
+    -- Teleport ON TOP of seller's head (works for both prompt-only and direct-sell)
+    root.CFrame = CFrame.new(sp.Position + Vector3.new(0, 3, 0))
     root.Velocity = Vector3.new(0,0,0)
   end
-  wait(0.1)
+  -- Faster signaling: SellResult listener + parallel firing attempts
   local resultCount = 0
   local con
   if SellResult then
@@ -274,93 +275,235 @@ local function doSell()
       resultCount = resultCount + 1
     end)
   end
-  if prompt then
-    pcall(function() fireproximityprompt(prompt) end)
-    wait(0.1)
-    if resultCount == 0 then
-      pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-        wait(0.02)
-        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-      end)
-      wait(0.15)
+  -- Try in parallel: proximity prompt + virtual E key + fire-server variants. Whichever the server accepts first wins.
+  spawn(function()
+    if prompt then pcall(function() fireproximityprompt(prompt) end) end
+    pcall(function()
+      local vim = game:GetService("VirtualInputManager")
+      vim:SendKeyEvent(true, Enum.KeyCode.E, false, game); wait(0.02)
+      vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+  end)
+  spawn(function()
+    if SellRequest then
+      pcall(function() SellRequest:FireServer() end)
+      pcall(function() SellRequest:FireServer({action = "all"}) end)
+      pcall(function() SellRequest:FireServer("all") end)
+      pcall(function() SellRequest:FireServer("SellAll") end)
     end
-  end
+  end)
+  -- Spend less time waiting: 1.0s is plenty for a server roundtrip
   local waited = 0
-  while resultCount < 1 and waited < 1.5 do wait(0.1); waited = waited + 0.1 end
+  while resultCount < 1 and waited < 1.0 do wait(0.1); waited = waited + 0.1 end
   if resultCount == 0 and prompt then pcall(function() fireproximityprompt(prompt) end) end
-  if SellRequest then
-    pcall(function() SellRequest:FireServer() end)
-    pcall(function() SellRequest:FireServer({action = "all"}) end)
+  wait(0.05)
+  -- Verify sell actually happened: dropped weight should drop by at least 80% of original. If not, try once more with another prompt firing.
+  local after = getUsedWeight()
+  if after >= used * 0.5 and prompt then
+    pcall(function() fireproximityprompt(prompt) end)
     pcall(function() SellRequest:FireServer("all") end)
-    pcall(function() SellRequest:FireServer("SellAll") end)
+    wait(0.4)
   end
-  wait(0.1)
-  waited = 0
-  while resultCount < 2 and waited < 0.8 do wait(0.05); waited = waited + 0.05 end
   if con then pcall(con.Disconnect, con); con = nil end
-  statusText = getUsedWeight() < used and "Sold!" or "Sell failed"
-  return getUsedWeight() < used
+  local finalW = getUsedWeight()
+  statusText = finalW < used and "Sold!" or "Sell failed"
+  return finalW < used
+end
+
+local function clickDeathButtons()
+  -- Find any visible death/REVIVE/SPACE buttons across the whole PlayerGui hierarchy and click them.
+  -- Tries mouse click via VirtualInputManager. Also tries key E (auto-revive) and SPACE.
+  local vim = game:GetService("VirtualInputManager")
+  local clicked = false
+  pcall(function()
+    for _, g in pairs(player.PlayerGui:GetDescendants()) do
+      if g:IsA("TextButton") and g.Visible and g.AbsoluteSize.X > 0 then
+        local t = (g.Text or ""):lower()
+        -- Match buttons: REVIVE, RESPAWN, BASE, OK, CONTINUE, SKIP, etc.
+        if t:find("revive") or t:find("respawn") or t:find("rev") or t == "base" or t == "spawn" or t.find(t, "got") or t.find(t, "back") or t.find(t, "continue") or t.find(t, "ok") then
+          local x = g.AbsolutePosition.X + g.AbsoluteSize.X/2
+          local y = g.AbsolutePosition.Y + g.AbsoluteSize.Y/2
+          vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+          wait(0.05)
+          vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+          clicked = true
+        end
+      end
+      -- Some games use ImageButton instead of TextButton for death buttons
+      if not clicked and g:IsA("ImageButton") and g.Visible and g.AbsoluteSize.X > 0 then
+        local n = (g.Name or ""):lower()
+        if n:find("revive") or n:find("respawn") or n:find("base") or n:find("die") or n:find("death") then
+          local x = g.AbsolutePosition.X + g.AbsoluteSize.X/2
+          local y = g.AbsolutePosition.Y + g.AbsoluteSize.Y/2
+          vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+          wait(0.05)
+          vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+          clicked = true
+        end
+      end
+    end
+  end)
+  -- Keys that some games accept for revive: E, SPACE, R
+  if not clicked then
+    pcall(function()
+      vim:SendKeyEvent(true, Enum.KeyCode.E, false, game); wait(0.03)
+      vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    pcall(function()
+      vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game); wait(0.03)
+      vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+    end)
+  end
+  return clicked
 end
 
 local function waitForRespawn()
-  for i = 1, 60 do
+  for i = 1, 80 do
     if not farming then return false end
     local char = player.Character
     if char and char:FindFirstChild("Humanoid") then
       local hum = char:FindFirstChild("Humanoid")
       if hum and hum.Health > 0 then return true end
     end
-    pcall(function()
-      for _, g in pairs(player.PlayerGui:GetDescendants()) do
-        if g:IsA("TextButton") and g.Visible and g.AbsoluteSize.X > 0 then
-          local t = (g.Text or ""):lower()
-          if t:find("respawn") or t:find("revive") or t:find("spawn") then
-            local vim = game:GetService("VirtualInputManager")
-            local x, y = g.AbsolutePosition.X + g.AbsoluteSize.X/2, g.AbsolutePosition.Y + g.AbsoluteSize.Y/2
-            vim:SendMouseButtonEvent(x, y, 0, true, game, 0); wait(0.05)
-            vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
-          end
-        end
-      end
-    end)
+    -- Try clicking any visible REVIVE / BASE / RESPAWN buttons. Do this FIRST before LoadCharacter.
+    clickDeathButtons()
+    -- Force respawn as a fallback
     pcall(function() player:LoadCharacter() end)
-    wait(0.5)
+    -- Tiny wait, then loop — clickDeathButtons is cheap if no buttons exist yet
+    wait(0.25)
   end
   return false
 end
 
+-- ALSO: hook Humanoid.Died from the very beginning so the moment the user dies, we start clicking REVIVE immediately
+-- (only matters after first CharacterAdded; CharacterAdded is a connection we attach once)
+local _deathClickHooked = false
+local function hookDeathClickHandler(char)
+  if _deathClickHooked then return end
+  local hum = char:FindFirstChildOfClass("Humanoid")
+  if not hum then return end
+  _deathClickHooked = true
+  hum.Died:Connect(function()
+    if not farming then return end
+    -- Spin a fast-click loop for up to ~15 seconds or until character is alive again
+    spawn(function()
+      local st = tick()
+      while tick() - st < 15 do
+        if not farming then break end
+        local c = player.Character
+        if c and c:FindFirstChildOfClass("Humanoid") and c:FindFirstChildOfClass("Humanoid").Health > 0 then break end
+        clickDeathButtons()
+        wait(0.1)
+      end
+    end)
+  end)
+end
+
+-- Auto-hook on every spawn
+local _deathHookConnecting = player.CharacterAdded:Connect(function(char)
+  delay(0.3, function() hookDeathClickHandler(char) end)
+end)
+
+-- Hook current character right away if it exists
+if player.Character then
+  delay(0.3, function() hookDeathClickHandler(player.Character) end)
+end
+
+-- ═══ DROP PROTECTION: vault that stashes tools during ragdoll/death so crystals don't get lost ═══
+local dropVault = Instance.new("Folder")
+dropVault.Name = "DropVault"
+dropVault.Parent = player
+
+local function stashDropsToVault()
+  local bp = player:FindFirstChild("Backpack")
+  if not bp then return end
+  for _, t in pairs(bp:GetChildren()) do
+    if t:IsA("Tool") then
+      pcall(function() t.Parent = dropVault end)
+    end
+  end
+end
+
+local function restoreVaultToBackpack()
+  for _, t in pairs(dropVault:GetChildren()) do
+    if t:IsA("Tool") then
+      local bp = player:FindFirstChild("Backpack")
+      if bp then
+        pcall(function() t.Parent = bp end)
+      else
+        pcall(function() t.Parent = dropVault end)
+      end
+    end
+  end
+end
+
+local antiRagdollStateCon = nil
+local antiRagdollDiedCon = nil
+local antiRagdollAddingCon = nil
+
 local function applyAntiRagdoll()
   for _, c in pairs(antiRagdollCons) do pcall(c.Disconnect, c) end
   antiRagdollCons = {}
+  if antiRagdollStateCon then pcall(antiRagdollStateCon.Disconnect, antiRagdollStateCon); antiRagdollStateCon = nil end
+  if antiRagdollDiedCon then pcall(antiRagdollDiedCon.Disconnect, antiRagdollDiedCon); antiRagdollDiedCon = nil end
+  if antiRagdollAddingCon then pcall(antiRagdollAddingCon.Disconnect, antiRagdollAddingCon); antiRagdollAddingCon = nil end
+
   local char = player.Character
   if not char then return end
   local hum = char:FindFirstChild("Humanoid")
   local root = char:FindFirstChild("HumanoidRootPart")
   if not hum then return end
   antiRagdollEnabled = true
-  local hb
-  hb = rs2.Heartbeat:Connect(function()
-    if not antiRagdollEnabled or not hum or not hum.Parent then if hb then hb:Disconnect() end; return end
-    pcall(function()
-      hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-      hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-      hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-      hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
-      local s = hum:GetState()
-      if s ~= Enum.HumanoidStateType.Running and s ~= Enum.HumanoidStateType.RunningNoPhysics then hum:ChangeState(Enum.HumanoidStateType.Running) end
-      if hum.Health < hum.MaxHealth then hum.Health = hum.MaxHealth end
-      if root and root.Velocity.Y < -20 then root.Velocity = Vector3.new(root.Velocity.X, -10, root.Velocity.Z) end
-    end)
+
+  -- ONE-TIME setup: disable problematic states. Doing this in a Heartbeat loop caused state thrash and conflict with the farm teleport.
+  pcall(function()
+    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
   end)
-  table.insert(antiRagdollCons, hb)
+
+  -- React instantly when state changes — single listener, fires only when state actually transitions
+  antiRagdollStateCon = hum.StateChanged:Connect(function(_, newState)
+    if not antiRagdollEnabled then return end
+    if newState == Enum.HumanoidStateType.Ragdoll
+      or newState == Enum.HumanoidStateType.FallingDown
+      or newState == Enum.HumanoidStateType.Physics
+      or newState == Enum.HumanoidStateType.GettingUp
+      or newState == Enum.HumanoidStateType.Freefall then
+      pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+    end
+  end)
+
+  -- On death: drop-protection — vault any tools kept only in Backpack so the user's crystals aren't lost
+  antiRagdollDiedCon = hum.Died:Connect(function()
+    if not antiRagdollEnabled then return end
+    pcall(stashDropsToVault)
+  end)
+
+  -- After respawn: bring any vaulted tools back into the new Backpack
+  antiRagdollAddingCon = player.CharacterAdded:Connect(function()
+    if not antiRagdollEnabled then return end
+    delay(0.5, restoreVaultToBackpack)
+  end)
+
+  -- Restore any tools already waiting in the vault from a previous death
+  pcall(restoreVaultToBackpack)
+
+  table.insert(antiRagdollCons, antiRagdollStateCon)
+  table.insert(antiRagdollCons, antiRagdollDiedCon)
+  table.insert(antiRagdollCons, antiRagdollAddingCon)
 end
 
 local function clearAntiRagdoll()
   antiRagdollEnabled = false
   for _, c in pairs(antiRagdollCons) do pcall(c.Disconnect, c) end
   antiRagdollCons = {}
+  if antiRagdollStateCon then pcall(antiRagdollStateCon.Disconnect, antiRagdollStateCon); antiRagdollStateCon = nil end
+  if antiRagdollDiedCon then pcall(antiRagdollDiedCon.Disconnect, antiRagdollDiedCon); antiRagdollDiedCon = nil end
+  if antiRagdollAddingCon then pcall(antiRagdollAddingCon.Disconnect, antiRagdollAddingCon); antiRagdollAddingCon = nil end
+  -- Bring any vaulted tools back to inventory when disabling
+  pcall(restoreVaultToBackpack)
 end
 
 local function updateESP()
@@ -436,47 +579,69 @@ local function farmLoop()
     local tier = crystal:GetAttribute("TierName") or "?"
     local sz = crystal:GetAttribute("SizeClass") or "?"
 
-    -- Smart auto sell: if best target won't fit due to weight, sell lesser carried items
+    -- Smart auto sell: drop only items that have LOWER value/weight than the new target
+    -- before mining the target, so we always net-gain value per weight
     if smartSellOn then
       local targetWeight = tonumber(crystal:GetAttribute("WeightKg") or 0) or 0
       local targetValue = scoreCrystal(crystal)
       local used = getUsedWeight()
       local max = getMaxWeight()
       if used + targetWeight > max then
-        -- Collect backpack tools with their value/weight
         local bp = player:FindFirstChild("Backpack")
         if bp then
+          -- Compute target value-per-weight efficiency
+          local targetEfficiency = targetValue / math.max(targetWeight, 0.001)
+
+          -- Collect all held items with their value/weight ratio
           local held = {}
           for _, t in pairs(bp:GetChildren()) do
             if t:IsA("Tool") then
-              held[#held+1] = {tool=t, value=tonumber(t:GetAttribute("Value")) or 0, weight=tonumber(t:GetAttribute("WeightKg")) or 0}
+              local v = tonumber(t:GetAttribute("Value")) or 0
+              local w = tonumber(t:GetAttribute("WeightKg")) or 0
+              held[#held+1] = {
+                tool = t,
+                value = v,
+                weight = w,
+                eff = v / math.max(w, 0.001)
+              }
             end
           end
-          -- Score each: drop lowest value-per-weight first
-          table.sort(held, function(a, b)
-            local sA = a.value / math.max(a.weight, 0.001)
-            local sB = b.value / math.max(b.weight, 0.001)
-            return sA < sB
-          end)
-          -- Sell target's divinity: target value should be >= sum of lowest held items to justify it
+
+          -- Sort by efficiency ascending: lowest value/weight first = drop weakest items first
+          table.sort(held, function(a, b) return a.eff < b.eff end)
+
+          -- Drop items ONLY if their efficiency is worse than the target's efficiency.
+          -- Keep dropping until we either have enough room for the target, OR all remaining held items are better than target.
           local freedWeight = 0
-          local soldValue = 0
           local toSell = {}
+          local bestVsSold = false
           for _, item in ipairs(held) do
             if used - freedWeight + targetWeight <= max then break end
+            -- Skip items that are better value-per-weight than target (don't drop those)
+            if item.eff >= targetEfficiency then
+              -- remaining items are all >= target; stopping here means the swap isn't profitable
+              break
+            end
             toSell[#toSell+1] = item.tool
             freedWeight = freedWeight + item.weight
-            soldValue = soldValue + item.value
+            bestVsSold = true
           end
-          -- Only smart-sell if target's value (with priority: value + weight*10) exceeds the sold items
-          local targetScore = targetValue + targetWeight * 10
-          if targetScore > soldValue and #toSell > 0 then
-            statusText = "Smart sell " .. #toSell .. " items"
-            doSell()
-            wait(0.3)
-            -- Re-evaluate targets
-            local newCrystal = findBestCrystal()
-            if newCrystal then crystal = newCrystal end
+          if bestVsSold and #toSell > 0 then
+            -- Sanity check: ensure target's VALUE alone is >= sum of dropped items' values (else no net gain)
+            local droppedValue = 0
+            for _, item in ipairs(held) do
+              for _, sold in ipairs(toSell) do
+                if item.tool == sold then droppedValue = droppedValue + item.value end
+              end
+            end
+            if targetValue > droppedValue then
+              statusText = "Smart sell " .. #toSell .. " (target $"..fmtPrice(targetValue)..")"
+              doSell()
+              wait(0.25)
+              -- Re-evaluate targets now that we have room
+              local newCrystal = findBestCrystal()
+              if newCrystal then crystal = newCrystal end
+            end
           end
         end
       end
@@ -526,14 +691,20 @@ local function farmLoop()
     root.CFrame = CFrame.new(digPos); root.Velocity = Vector3.new(0,0,0)
     statusText = "Digging "..tier
     local holdPos = true
+    local digBroken = false
+    local digBrokenReason = ""
     spawn(function()
       while holdPos and root and root.Parent do
-        if (root.Position - digPos).Magnitude > 3 then
-          -- Check if character is "stuck" far away (region stream failed mid-dig) — don't keep snapping
-          local d = (root.Position - digPos).Magnitude
-          if d > 100 then
-            break
-          end
+        if not root or not root:IsDescendantOf(workspace) then
+          digBroken = true; digBrokenReason = "Character gone"
+          break
+        end
+        local d = (root.Position - digPos).Magnitude
+        if d > 100 then
+          digBroken = true; digBrokenReason = "Region unload mid-dig"
+          break
+        end
+        if d > 3 then
           root.CFrame = CFrame.new(digPos)
           root.Velocity = Vector3.new(0,0,0)
         end
@@ -545,6 +716,7 @@ local function farmLoop()
     if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(crystal) end) end end
     local lastMinedHP = crystal:GetAttribute("MinedHP") or 0
     local noChangeTick, dug = 0, false
+    local crystalGone = false
     -- Scale timeout by crystal size: bigger crystals need way more hits
     local sizeKey = crystal:GetAttribute("SizeClass") or ""
     local sizeMult = 1
@@ -555,23 +727,70 @@ local function farmLoop()
     elseif sizeKey == "Large" or sizeKey == "L" then sizeMult = 1.2
     end
     local scaledTimeout = math.floor(digTimeoutTicks * sizeMult)
-    for tick = 1, 1500 do
+    -- HARD CEILING: never let a single dig session run longer than 75 seconds regardless of size
+    local HARD_MAX_TICKS = math.floor(75 / 0.15)
+    local maxTicks = math.min(1500, math.max(scaledTimeout + 30, HARD_MAX_TICKS))
+    for tick = 1, maxTicks do
       wait(0.15)
       if not farming then break end
+      -- CHARACTER BROKEN: player died or character reset
+      char = player.Character
+      root = char and char:FindFirstChild("HumanoidRootPart")
+      if not char or not root or not root.Parent or not root:IsDescendantOf(workspace) then
+        digBroken = true; digBrokenReason = "Character reset"
+        break
+      end
+      -- BACKPACK FULL: skip the rest of the dig
       if getUsedWeight() >= getMaxWeight() then dug = true; break end
+      -- CRYSTAL DISAPPEARED: count as success (someone else got it / despawned)
+      if not crystal or not crystal.Parent or crystal.Parent == nil then
+        crystalGone = true; dug = true; break
+      end
       local hp = crystal:GetAttribute("MinedHP")
-      if hp and hp < lastMinedHP then
+      if hp ~= nil and hp < lastMinedHP then
         lastMinedHP = hp
         noChangeTick = 0
       end
-      if hp and hp <= 0 then dug = true; break end
+      if hp ~= nil and hp <= 0 then dug = true; break end
       noChangeTick = noChangeTick + 1
       if noChangeTick > scaledTimeout then break end
+      -- Mid-dig stuck sanity: if we've been at the dig pos for ages with zero progress AND we're actually still near the crystal, it's a legit slow dig; just keep firing
       if DigRequest then for _ = 1, 5 do pcall(function() DigRequest:FireServer(crystal) end) end end
       if CrystalHoldComplete then pcall(function() CrystalHoldComplete:FireServer(crystal) end) end
     end
     holdPos = false
-    if dug then statsCrystals = statsCrystals + 1; statsValue = statsValue + scoreCrystal(crystal)
+    -- If digBroken fired, force-respawn + skip this crystal for a long timeout
+    if digBroken then
+      statusText = "Dig broken ("..(digBrokenReason or "?")..") — recovering..."
+      -- Record this crystal as doomed for this session so we don't retry it instantly
+      failedCount[crystal] = (failedCount[crystal] or 0) + 1
+      if failedCount[crystal] >= 3 then
+        failedCrystals[crystal] = true
+      else
+        skippedCrystals[crystal] = tick() + 90
+      end
+      -- Try to recover by snapping back near the world origin or last crystal positions area;
+      -- best-effort safety net: if character is broken, attempt respawn; else snap character back to the crystal pos again
+      pcall(function()
+        char = player.Character
+        local rc = char and char:FindFirstChild("HumanoidRootPart")
+        if rc and crystal and crystal.Parent and crystal:IsA("BasePart") then
+          rc.CFrame = CFrame.new(crystal.Position + Vector3.new(0, 4, 0))
+          rc.Velocity = Vector3.new(0, 0, 0)
+          statusText = "Snapping back to crystal"
+        else
+          -- Last resort: respawn the character so the next loop recovers cleanly
+          if player.Health then wait(1) else player:LoadCharacter() end
+        end
+      end)
+      wait(0.5)
+      highlightBox.Visible = false
+      continue
+    end
+    if dug then
+      statsCrystals = statsCrystals + 1
+      statsValue = statsValue + scoreCrystal(crystal)
+      if crystalGone then statusText = "Crystal gone — counted" end
     else
       failedCount[crystal] = (failedCount[crystal] or 0) + 1
       if failedCount[crystal] >= 3 then
@@ -1770,16 +1989,18 @@ spawn(function()
     if char then
       local root = char:FindFirstChild("HumanoidRootPart")
       if root and CrystalDroppedPickup then
-        for _, obj in pairs(workspace:GetChildren()) do
+        -- Search workspace descendants (tools may be deep in hierarchy)
+        -- Aggressive: 18 studs range, scan every 0.3s
+        for _, obj in pairs(workspace:GetDescendants()) do
           if obj:IsA("Tool") and obj:FindFirstChild("Handle") then
-            if (obj.Handle.Position - root.Position).Magnitude <= 12 then
+            if (obj.Handle.Position - root.Position).Magnitude <= 18 then
               pcall(function() CrystalDroppedPickup:FireServer(obj) end)
             end
           end
         end
       end
     end
-    wait(0.5)
+    wait(0.3)
   end
 end)
 
