@@ -1,8 +1,3 @@
---[[
-  Mine Hub v4 — Axel Hub style
-  All logic defined first, UI second
-]]
-
 local player = game.Players.LocalPlayer
 local rs = game:GetService("ReplicatedStorage")
 local tw = game:GetService("TweenService")
@@ -2715,4 +2710,4 @@ do
   end
 end
 
-print("[Hub] Ready — Mine Hub v7 (Axel Hub 1:1)")
+print("[Hub] Ready — Sporplut's Hub v1")
