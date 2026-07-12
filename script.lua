@@ -20,6 +20,10 @@ local SellResult = remotes:FindFirstChild("SellResult")
 local BombBuyRequest = remotes:FindFirstChild("BombBuyRequest")
 local BombShopQuery = remotes:FindFirstChild("BombShopQuery")
 local BombShopRestocked = remotes:FindFirstChild("BombShopRestocked")
+local ragdollRemotes = rs:FindFirstChild("RagdollSystemPackage") and rs.RagdollSystemPackage:FindFirstChild("RagdollSystem") and rs.RagdollSystemPackage.RagdollSystem:FindFirstChild("Remotes")
+local DeactivateRagdollRemote = ragdollRemotes and ragdollRemotes:FindFirstChild("DeactivateRagdollRemote")
+local CollapseRagdollRemote = ragdollRemotes and ragdollRemotes:FindFirstChild("CollapseRagdollRemote")
+local ActivateRagdollRemote = ragdollRemotes and ragdollRemotes:FindFirstChild("ActivateRagdollRemote")
 
 local ls = player:FindFirstChild("leaderstats")
 local cashVal
@@ -52,6 +56,8 @@ local noCrystalTimer = 0
 local skippedCrystals = {}
 local failedCrystals = {}
 local failedCount = {}
+local deathAtCrystal = {} -- {[crystal] = count} deaths per crystal location
+local _currentDigKey = nil
 local statsCrystals = 0
 local statsValue = 0
 local statsBombs = 0
@@ -62,6 +68,8 @@ local hopEnabled = false
 local hopTimer = 0
 local hopMinValue = 100000000  -- server-hop threshold: hop if all crystals combined > this
 local hopDelaySeconds = 60     -- server-hop countdown (configurable via slider, 10-180s)
+local visitedServers = {}      -- {[serverId] = tick()} hop blacklist
+local VISIT_COOLDOWN = 600     -- 10 minutes before re-visiting a server
 local noCrystalSellTrigger = 5 -- sell every N seconds when no qualified crystals
 local noCrystalSeconds = 0
 
@@ -74,8 +82,12 @@ local function isCrystal(obj)
   if not (obj:IsA("MeshPart") or obj:IsA("Part")) then return false end
   local ok, tier = pcall(function() return obj:GetAttribute("TierName") end)
   if not ok or not tier then return false end
-  local path = obj:GetFullName()
-  if path:find("Plots") or path:find("PlacedCrystals") then return false end
+  local p = obj.Parent
+  while p and p ~= workspace do
+    local n = p.Name
+    if n == "Plots" or n == "PlacedCrystals" then return false end
+    p = p.Parent
+  end
   return true
 end
 
@@ -102,6 +114,20 @@ end)
 -- Initial cache build (so first frame after script start can use it)
 rebuildCrystalCache()
 
+local _failedCrystalTime = {} -- {[obj] = tick()} when it was blacklisted
+local _FAILED_TTL = 300 -- 5 minutes before a blacklisted crystal gets a second chance
+
+local function clearOldFailures()
+  local now = tick()
+  for obj, t in pairs(_failedCrystalTime) do
+    if now - t >= _FAILED_TTL then
+      _failedCrystalTime[obj] = nil
+      failedCrystals[obj] = nil
+      failedCount[obj] = nil
+    end
+  end
+end
+
 -- Safety rebuild trigger (called by main farm/spawn loops every ~30s)
 local function ensureCacheFresh()
   if tick() - _lastCacheRebuild > 30 then rebuildCrystalCache() end
@@ -115,6 +141,7 @@ local sizeTogState = {}
 local bombTogState = {}
 
 local espFolder = Instance.new("Folder"); espFolder.Name = "CrystalESP"; espFolder.Parent = player.PlayerGui
+local _espLabels = {} -- {[crystalObj] = {bb=BillboardGui, tl=TextLabel}}
 local highlightBox = Instance.new("SelectionBox"); highlightBox.Color3 = Color3.fromRGB(80,210,130); highlightBox.LineThickness = 0.03; highlightBox.SurfaceColor3 = Color3.fromRGB(80,210,130); highlightBox.Visible = false; highlightBox.Parent = player.PlayerGui
 
 local gui -- set when GUI is created
@@ -161,10 +188,8 @@ end
 local SIZE_RANK = {["Tiny"]=1, ["Small"]=2, ["S"]=2, ["Medium"]=3, ["M"]=3, ["Large"]=4, ["L"]=4, ["XL"]=5, ["Huge"]=6, ["Giant"]=7, ["Colossal"]=8, ["Leviathan"]=9, ["Titan"]=10}
 local function getCrystalSizes()
   local sz = {}
-  for _, obj in pairs(ws:GetDescendants()) do
-    if (obj:IsA("MeshPart") or obj:IsA("Part")) and obj:GetAttribute("TierName") then
-      local p = obj:GetFullName()
-      if p:find("Plots") or p:find("PlacedCrystals") then continue end
+  for obj in pairs(_crystalCache) do
+    if obj and obj.Parent then
       local s = obj:GetAttribute("SizeClass")
       if s then sz[tostring(s)] = true end
     end
@@ -357,65 +382,58 @@ local function doSell()
 end
 
 local function clickDeathButtons()
-  -- Find any visible death/REVIVE/SPACE buttons across the whole PlayerGui hierarchy and click them.
-  -- Tries mouse click via VirtualInputManager. Also tries key E (auto-revive) and SPACE.
-  local vim = game:GetService("VirtualInputManager")
-  local clicked = false
+  -- 1) Fire ReviveBase remote directly (dynamic lookup)
   pcall(function()
+    local rb = remotes:FindFirstChild("ReviveBase") or rs:WaitForChild("Remotes", 2):FindFirstChild("ReviveBase")
+    if rb then rb:FireServer() end
+  end)
+  -- 2) Click the actual Base/Revive ImageButtons via VIM
+  pcall(function()
+    local vim = game:GetService("VirtualInputManager")
     for _, g in pairs(player.PlayerGui:GetDescendants()) do
-      if g:IsA("TextButton") and g.Visible and g.AbsoluteSize.X > 0 then
-        local t = (g.Text or ""):lower()
-        -- Match buttons: REVIVE, RESPAWN, BASE, OK, CONTINUE, SKIP, etc.
-        if t:find("revive") or t:find("respawn") or t:find("rev") or t == "base" or t == "spawn" or t.find(t, "got") or t.find(t, "back") or t.find(t, "continue") or t.find(t, "ok") then
-          local x = g.AbsolutePosition.X + g.AbsoluteSize.X/2
-          local y = g.AbsolutePosition.Y + g.AbsoluteSize.Y/2
-          vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
-          wait(0.05)
-          vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
-          clicked = true
-        end
-      end
-      -- Some games use ImageButton instead of TextButton for death buttons
-      if not clicked and g:IsA("ImageButton") and g.Visible and g.AbsoluteSize.X > 0 then
+      if g:IsA("GuiButton") then
         local n = (g.Name or ""):lower()
-        if n:find("revive") or n:find("respawn") or n:find("base") or n:find("die") or n:find("death") then
-          local x = g.AbsolutePosition.X + g.AbsoluteSize.X/2
-          local y = g.AbsolutePosition.Y + g.AbsoluteSize.Y/2
-          vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
-          wait(0.05)
-          vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
-          clicked = true
+        if n == "base" or n == "revive" then
+          local x = g.AbsolutePosition.X + g.AbsoluteSize.X / 2
+          local y = g.AbsolutePosition.Y + g.AbsoluteSize.Y / 2
+          if x > 0 and y > 0 then
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            wait(0.02)
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+          end
         end
       end
     end
   end)
-  -- Keys that some games accept for revive: E, SPACE, R
-  if not clicked then
-    pcall(function()
-      vim:SendKeyEvent(true, Enum.KeyCode.E, false, game); wait(0.03)
-      vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-    end)
-    pcall(function()
-      vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game); wait(0.03)
-      vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-    end)
-  end
-  return clicked
+  -- 3) Try MountainResetStart remote (base respawn fallback)
+  pcall(function()
+    local mr = remotes:FindFirstChild("MountainResetStart")
+    if mr then mr:FireServer() end
+  end)
+  return true
 end
 
 local function waitForRespawn()
-  for i = 1, 80 do
+  -- First: fire remote + click buttons 5 times before trying LoadCharacter
+  for i = 1, 5 do
     if not farming then return false end
     local char = player.Character
     if char and char:FindFirstChild("Humanoid") then
       local hum = char:FindFirstChild("Humanoid")
       if hum and hum.Health > 0 then return true end
     end
-    -- Try clicking any visible REVIVE / BASE / RESPAWN buttons. Do this FIRST before LoadCharacter.
     clickDeathButtons()
-    -- Force respawn as a fallback
+    wait(0.1)
+  end
+  -- Now try LoadCharacter loop as fallback
+  for i = 1, 75 do
+    if not farming then return false end
+    local char = player.Character
+    if char and char:FindFirstChild("Humanoid") then
+      local hum = char:FindFirstChild("Humanoid")
+      if hum and hum.Health > 0 then return true end
+    end
     pcall(function() player:LoadCharacter() end)
-    -- Tiny wait, then loop — clickDeathButtons is cheap if no buttons exist yet
     wait(0.25)
   end
   return false
@@ -431,7 +449,9 @@ local function hookDeathClickHandler(char)
   _deathClickHooked = true
   hum.Died:Connect(function()
     if not farming then return end
-    -- Spin a fast-click loop for up to ~15 seconds or until character is alive again
+    -- Immediately fire remote on death (don't wait for farmLoop)
+    clickDeathButtons()
+    -- Keep trying for up to 15 seconds
     spawn(function()
       local st = tick()
       while tick() - st < 15 do
@@ -447,7 +467,17 @@ end
 
 -- Auto-hook on every spawn
 local _deathHookConnecting = player.CharacterAdded:Connect(function(char)
+  _deathHooked = false
+  _deathClickHooked = false
   delay(0.3, function() hookDeathClickHandler(char) end)
+  -- Always-on: stash tools on death regardless of anti-ragdoll toggle
+  local h = char:FindFirstChildOfClass("Humanoid")
+  if h then
+    h.Died:Connect(function()
+      pcall(stashDropsToVault)
+      _currentDigKey = nil
+    end)
+  end
 end)
 
 -- Hook current character right away if it exists
@@ -462,10 +492,19 @@ dropVault.Parent = player
 
 local function stashDropsToVault()
   local bp = player:FindFirstChild("Backpack")
-  if not bp then return end
-  for _, t in pairs(bp:GetChildren()) do
-    if t:IsA("Tool") then
-      pcall(function() t.Parent = dropVault end)
+  if bp then
+    for _, t in pairs(bp:GetChildren()) do
+      if t:IsA("Tool") then
+        pcall(function() t.Parent = dropVault end)
+      end
+    end
+  end
+  local char = player.Character
+  if char then
+    for _, t in pairs(char:GetChildren()) do
+      if t:IsA("Tool") then
+        pcall(function() t.Parent = dropVault end)
+      end
     end
   end
 end
@@ -486,6 +525,7 @@ end
 local antiRagdollStateCon = nil
 local antiRagdollDiedCon = nil
 local antiRagdollAddingCon = nil
+local antiRagdollHeartbeat = nil
 
 local function applyAntiRagdoll()
   for _, c in pairs(antiRagdollCons) do pcall(c.Disconnect, c) end
@@ -493,31 +533,60 @@ local function applyAntiRagdoll()
   if antiRagdollStateCon then pcall(antiRagdollStateCon.Disconnect, antiRagdollStateCon); antiRagdollStateCon = nil end
   if antiRagdollDiedCon then pcall(antiRagdollDiedCon.Disconnect, antiRagdollDiedCon); antiRagdollDiedCon = nil end
   if antiRagdollAddingCon then pcall(antiRagdollAddingCon.Disconnect, antiRagdollAddingCon); antiRagdollAddingCon = nil end
+  if antiRagdollHeartbeat then pcall(antiRagdollHeartbeat.Disconnect, antiRagdollHeartbeat); antiRagdollHeartbeat = nil end
 
   local char = player.Character
   if not char then return end
   local hum = char:FindFirstChild("Humanoid")
-  local root = char:FindFirstChild("HumanoidRootPart")
   if not hum then return end
   antiRagdollEnabled = true
 
-  -- ONE-TIME setup: disable problematic states. Doing this in a Heartbeat loop caused state thrash and conflict with the farm teleport.
-  pcall(function()
-    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-    hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
-  end)
+  -- NO SetStateEnabled — it causes ragdoll on mobile when toggled
+  -- Just react to state changes + keep PlatformStand off
 
-  -- React instantly when state changes — single listener, fires only when state actually transitions
+  -- Disable ragdoll states on NEW characters only (delay to avoid toggle-ragdoll)
+  local function disableStates(h)
+    delay(0.5, function()
+      if not antiRagdollEnabled then return end
+      pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false) end)
+      pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Physics, false) end)
+      pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false) end)
+    end)
+  end
+
+  disableStates(hum)
+
+  -- React when state changes — use GettingUp
   antiRagdollStateCon = hum.StateChanged:Connect(function(_, newState)
     if not antiRagdollEnabled then return end
     if newState == Enum.HumanoidStateType.Ragdoll
       or newState == Enum.HumanoidStateType.FallingDown
-      or newState == Enum.HumanoidStateType.Physics
-      or newState == Enum.HumanoidStateType.GettingUp
-      or newState == Enum.HumanoidStateType.Freefall then
-      pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+      or newState == Enum.HumanoidStateType.Physics then
+      pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+      pcall(function() if hum.PlatformStand then hum.PlatformStand = false end end)
+    end
+  end)
+
+  -- Heartbeat: only PlatformStand + remotes
+  antiRagdollHeartbeat = rs2.Heartbeat:Connect(function()
+    if not antiRagdollEnabled then return end
+    local ch = player.Character
+    if not ch then return end
+    local h = ch:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return end
+
+    pcall(function() if h.PlatformStand then h.PlatformStand = false end end)
+
+    local rr = ragdollRemotes
+    if not rr then
+      pcall(function() rr = rs.RagdollSystemPackage.RagdollSystem.Remotes end)
+      ragdollRemotes = rr
+    end
+    if rr then
+      local dr = rr:FindFirstChild("DeactivateRagdollRemote")
+      local cr = rr:FindFirstChild("CollapseRagdollRemote")
+      if dr then pcall(function() dr:FireServer() end) end
+      if cr then pcall(function() cr:FireServer() end) end
     end
   end)
 
@@ -534,7 +603,9 @@ local function applyAntiRagdoll()
   end)
 
   -- Restore any tools already waiting in the vault from a previous death
-  pcall(restoreVaultToBackpack)
+  -- DISABLED: calling restoreVaultToBackpack here moves tools which triggers
+  -- Unequipped/Equipped physics changes that CAUSE ragdoll on mobile
+  -- Tools are restored on death/respawn via the CharacterAdded handler instead
 
   table.insert(antiRagdollCons, antiRagdollStateCon)
   table.insert(antiRagdollCons, antiRagdollDiedCon)
@@ -548,30 +619,41 @@ local function clearAntiRagdoll()
   if antiRagdollStateCon then pcall(antiRagdollStateCon.Disconnect, antiRagdollStateCon); antiRagdollStateCon = nil end
   if antiRagdollDiedCon then pcall(antiRagdollDiedCon.Disconnect, antiRagdollDiedCon); antiRagdollDiedCon = nil end
   if antiRagdollAddingCon then pcall(antiRagdollAddingCon.Disconnect, antiRagdollAddingCon); antiRagdollAddingCon = nil end
-  -- Bring any vaulted tools back to inventory when disabling
+  if antiRagdollHeartbeat then pcall(antiRagdollHeartbeat.Disconnect, antiRagdollHeartbeat); antiRagdollHeartbeat = nil end
   pcall(restoreVaultToBackpack)
 end
 
+local _espRarityColors = {
+  Common=Color3.fromRGB(160,160,175), Uncommon=Color3.fromRGB(60,180,255),
+  Rare=Color3.fromRGB(60,230,200), Epic=Color3.fromRGB(160,80,255),
+  Legendary=Color3.fromRGB(255,200,50), Mythic=Color3.fromRGB(255,60,80),
+}
 local function updateESP()
-  for _, c in pairs(espFolder:GetChildren()) do c:Destroy() end
-  if not espEnabled then return end
+  if not espEnabled then
+    for obj, data in pairs(_espLabels) do if data.bb then data.bb:Destroy() end end
+    _espLabels = {}
+    return
+  end
   local char = player.Character
   local root = char and char:FindFirstChild("HumanoidRootPart")
   if not root then return end
-  -- Use cached crystal set instead of GetDescendants (much cheaper)
+  local rootPos = root.Position
+  local stale = {}
+  for obj, _ in pairs(_espLabels) do stale[obj] = true end
   for obj in pairs(_crystalCache) do
     if obj and obj.Parent then
-      local path = obj:GetFullName()
-      if not path:find("Plots") and not path:find("PlacedCrystals") then
-        local tier = obj:GetAttribute("TierName") or "?"
-        local val = obj:GetAttribute("Value") or 0
-        local dist = math.floor((obj.Position - root.Position).Magnitude)
-        if dist <= 200 then
-          local rarityColors = {
-            Common=Color3.fromRGB(160,160,175), Uncommon=Color3.fromRGB(60,180,255),
-            Rare=Color3.fromRGB(60,230,200), Epic=Color3.fromRGB(160,80,255),
-            Legendary=Color3.fromRGB(255,200,50), Mythic=Color3.fromRGB(255,60,80),
-          }
+      local tier = obj:GetAttribute("TierName")
+      local val = obj:GetAttribute("Value") or 0
+      local dist = (obj.Position - rootPos).Magnitude
+      if dist <= 200 then
+        stale[obj] = nil
+        local txt = tier.."  $"..fmtPrice(val).."  ["..math.floor(dist).."m]"
+        local col = _espRarityColors[tier] or Color3.new(1,1,1)
+        local data = _espLabels[obj]
+        if data then
+          data.tl.Text = txt
+          data.tl.TextColor3 = col
+        else
           local bb = Instance.new("BillboardGui")
           bb.Size = UDim2.new(0, 140, 0, 26)
           bb.StudsOffset = Vector3.new(0, 3, 0)
@@ -582,15 +664,21 @@ local function updateESP()
           tl.Size = UDim2.new(1, 0, 1, 0)
           tl.BackgroundTransparency = 0.3
           tl.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
-          tl.Text = tier.."  $"..fmtPrice(val).."  ["..dist.."m]"
-          tl.TextColor3 = rarityColors[tier] or Color3.new(1,1,1)
+          tl.Text = txt
+          tl.TextColor3 = col
           tl.TextSize = 11
           tl.Font = Enum.Font.GothamBold
           tl.Parent = bb
           local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 4); c.Parent = tl
+          _espLabels[obj] = {bb=bb, tl=tl}
         end
       end
     end
+  end
+  for obj, _ in pairs(stale) do
+    local data = _espLabels[obj]
+    if data then if data.bb then data.bb:Destroy() end end
+    _espLabels[obj] = nil
   end
 end
 
@@ -611,8 +699,11 @@ local function performDig(targetCrystal, targetTier, targetSize)
   end
   local tpDist = (root.Position - digPos).Magnitude
   if tpDist > 100 then
-    statusText = "Region not loaded — skip 60s"
-    skippedCrystals[targetCrystal] = tick() + 60
+    local skipCount = (failedCount[targetCrystal] or 0) + 1
+    failedCount[targetCrystal] = skipCount
+    local skipTime = math.min(60 * 2^(skipCount - 1), 480)
+    statusText = "Region not loaded — skip "..skipTime.."s"
+    skippedCrystals[targetCrystal] = tick() + skipTime
     return "continue"
   end
   root.CFrame = CFrame.new(digPos); root.Velocity = Vector3.new(0,0,0)
@@ -633,7 +724,25 @@ local function performDig(targetCrystal, targetTier, targetSize)
         digBroken = true; digBrokenReason = "Region unload mid-dig"
         break
       end
-      if d > 3 then
+      if d > 50 then
+        -- Try re-TP first: chunks may need time to load
+        for retry = 1, 5 do
+          pcall(function()
+            root.CFrame = CFrame.new(digPos)
+            root.Velocity = Vector3.new(0, 0, 0)
+          end)
+          wait(1)
+          root = char and char:FindFirstChild("HumanoidRootPart")
+          if root then
+            d = (root.Position - digPos).Magnitude
+            if d <= 50 then break end
+          end
+        end
+        if d > 50 then
+          digBroken = true; digBrokenReason = "Too far after 5 retries ("..math.floor(d).."m)"
+          break
+        end
+      elseif d > 3 then
         root.CFrame = CFrame.new(digPos)
         root.Velocity = Vector3.new(0,0,0)
       end
@@ -648,6 +757,7 @@ local function performDig(targetCrystal, targetTier, targetSize)
   local noChangeTick, dug = 0, false
   local crystalGone = false
   local lastProgressTime = tick()
+  local noServerResponseTime = tick()
   local sizeKey = targetCrystal:GetAttribute("SizeClass") or ""
   local sizeMult = 1
   if sizeKey == "Titan" then sizeMult = 3
@@ -669,11 +779,51 @@ local function performDig(targetCrystal, targetTier, targetSize)
       digBroken = true; digBrokenReason = "Character reset"
       break
     end
+    -- Distance check: if character got flung/ragdolled/teleported far from crystal, try re-TP first
+    if targetCrystal and targetCrystal.Parent then
+      local distToCrystal = (root.Position - targetCrystal.Position).Magnitude
+      if distToCrystal > 50 then
+        -- Try re-TP: chunks may need time to load
+        local retpOk = false
+        for retry = 1, 5 do
+          pcall(function()
+            root.CFrame = CFrame.new(targetCrystal.Position + Vector3.new(0, 4, 0))
+            root.Velocity = Vector3.new(0, 0, 0)
+          end)
+          wait(1)
+          char = player.Character
+          root = char and char:FindFirstChild("HumanoidRootPart")
+          if root and targetCrystal and targetCrystal.Parent then
+            distToCrystal = (root.Position - targetCrystal.Position).Magnitude
+            if distToCrystal <= 50 then retpOk = true; break end
+          end
+        end
+        if not retpOk then
+          digBroken = true; digBrokenReason = "Too far from crystal ("..math.floor(distToCrystal).."m)"
+          break
+        end
+      end
+    end
     if getUsedWeight() >= getMaxWeight() then dug = true; break end
+    -- Death check mid-dig
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then
+      digBroken = true; digBrokenReason = "Died mid-dig"
+      break
+    end
     if not targetCrystal or not targetCrystal.Parent then
       crystalGone = true; dug = true; break
     end
     local hp = targetCrystal:GetAttribute("MinedHP")
+    if type(hp) == "number" then
+      noServerResponseTime = tick()  -- server responded, reset timer
+    end
+    -- Bail fast if server never sends MinedHP after 15s
+    if type(hp) ~= "number" and tick() - noServerResponseTime > 15 then
+      digBroken = true
+      digBrokenReason = "Server never sent crystal HP (15s timeout)"
+      break
+    end
     if type(hp) == "number" and hp < lastMinedHP and hp > 0 then
       lastMinedHP = hp
       noChangeTick = 0
@@ -708,6 +858,7 @@ local function performDig(targetCrystal, targetTier, targetSize)
     failedCount[targetCrystal] = (failedCount[targetCrystal] or 0) + 1
     if failedCount[targetCrystal] >= 3 then
       failedCrystals[targetCrystal] = true
+      _failedCrystalTime[targetCrystal] = tick()
     else
       skippedCrystals[targetCrystal] = tick() + 90
     end
@@ -726,11 +877,12 @@ local function performDig(targetCrystal, targetTier, targetSize)
     return "broken"
   end
   if dug then
-    statsCrystals = statsCrystals + 1
-    statsValue = statsValue + scoreCrystal(targetCrystal)
     highlightBox.Visible = false
-    if crystalGone then return "gone"
-    elseif digDone then return "mined"
+    if digDone then
+      statsCrystals = statsCrystals + 1
+      statsValue = statsValue + scoreCrystal(targetCrystal)
+      return "mined"
+    elseif crystalGone then return "gone"
     else return "full" end
   end
   -- Timeout exit
@@ -738,6 +890,7 @@ local function performDig(targetCrystal, targetTier, targetSize)
   failedCount[targetCrystal] = (failedCount[targetCrystal] or 0) + 1
   if failedCount[targetCrystal] >= 3 then
     failedCrystals[targetCrystal] = true
+    _failedCrystalTime[targetCrystal] = tick()
   elseif failedCount[targetCrystal] == 2 then
     skippedCrystals[targetCrystal] = tick() + 60
   else
@@ -748,6 +901,7 @@ local function performDig(targetCrystal, targetTier, targetSize)
 end
 
 -- ═══ Smart-sell helper (extracted to keep farmLoop register pressure low) ═══
+-- Game sell mechanism sells ALL items, so: only sell if target crystal > total held value.
 local function trySmartSell(currentCrystal)
   if not smartSellOn then return currentCrystal end
   local targetWeight = tonumber(currentCrystal:GetAttribute("WeightKg") or 0) or 0
@@ -758,37 +912,19 @@ local function trySmartSell(currentCrystal)
   local bp = player:FindFirstChild("Backpack")
   if not bp then return currentCrystal end
 
-  local targetEfficiency = targetValue / math.max(targetWeight, 0.001)
-  local held = {}
+  local totalHeldValue = 0
+  local heldCount = 0
   for _, t in pairs(bp:GetChildren()) do
     if t:IsA("Tool") then
-      local v = tonumber(t:GetAttribute("Value")) or 0
-      local w = tonumber(t:GetAttribute("WeightKg")) or 0
-      held[#held+1] = { tool = t, value = v, weight = w, eff = v / math.max(w, 0.001) }
+      totalHeldValue = totalHeldValue + (tonumber(t:GetAttribute("Value")) or 0)
+      heldCount = heldCount + 1
     end
   end
-  table.sort(held, function(a, b) return a.eff < b.eff end)
+  if heldCount == 0 then return currentCrystal end
 
-  local freedWeight = 0
-  local toSell = {}
-  for _, item in ipairs(held) do
-    if used - freedWeight + targetWeight <= max then break end
-    if item.eff >= targetEfficiency then break end
-    toSell[#toSell+1] = item.tool
-    freedWeight = freedWeight + item.weight
-  end
-  if #toSell == 0 then return currentCrystal end
+  if targetValue <= totalHeldValue then return currentCrystal end
 
-  -- Sanity: target value alone must exceed sum of dropped values
-  local droppedValue = 0
-  for _, item in ipairs(held) do
-    for _, sold in ipairs(toSell) do
-      if item.tool == sold then droppedValue = droppedValue + item.value end
-    end
-  end
-  if targetValue <= droppedValue then return currentCrystal end
-
-  statusText = "Smart sell " .. #toSell .. " (target $"..fmtPrice(targetValue)..")"
+  statusText = "Smart sell all ($"..fmtPrice(totalHeldValue)..") for $"..fmtPrice(targetValue)
   doSell()
   wait(0.25)
   -- Re-evaluate now that there's room
@@ -803,19 +939,32 @@ local function farmLoop()
     local hum = char and char:FindFirstChild("Humanoid")
     if not char or not hum or hum.Health <= 0 then
       statusText = "Dead — respawning"
+      if _currentDigKey then
+        deathAtCrystal[_currentDigKey] = (deathAtCrystal[_currentDigKey] or 0) + 1
+        if deathAtCrystal[_currentDigKey] >= 3 then
+          failedCrystals[_currentDigKey] = tick() + 300
+          print("[Hub] Death circuit breaker: skipped crystal after 3 deaths")
+        end
+      end
       if waitForRespawn() then statusText = "Respawned"; wait(1)
-      else statusText = "Respawn failed" end
+      else statusText = "Respawn failed — stopped (kicked?)"; farming = false end
       continue
     end
     local maxW = getMaxWeight()
     local used = getUsedWeight()
     bpText = string.format("%.1f / %d kg", used, maxW)
     if used >= maxW then
-      if sellOn and doSell() then statusText = "Sold!"
-      else statusText = "Backpack full"; wait(0.5) end
+      if sellOn then
+        if doSell() then statusText = "Sold!"
+        else statusText = "Sell failed"; wait(2) end
+      else
+        statusText = "Backpack full — enable Auto Sell"
+        wait(3)
+      end
       continue
     end
     ensureCacheFresh()
+    clearOldFailures()
     local crystal = findBestCrystal()
     if not crystal then
       noCrystalTimer = noCrystalTimer + 0.5
@@ -854,8 +1003,24 @@ local function farmLoop()
           owned = findBombInBackpack(bombId)
           if owned then
             statusText = "Bombing "..tier
-            if equipBomb(bombId) then useBomb(crystal.Position); statsBombs = statsBombs + 1; wait(1); unequipBomb(); wait(0.5) end
-            highlightBox.Visible = false; continue
+            if equipBomb(bombId) then
+              useBomb(crystal.Position)
+              statsBombs = statsBombs + 1
+              wait(2)
+              unequipBomb()
+              wait(0.5)
+            end
+            -- Check if crystal survived the bomb — dig it if so
+            if crystal and crystal.Parent then
+              local hp = crystal:GetAttribute("MinedHP")
+              if type(hp) == "number" and hp > 0 then
+                highlightBox.Adornee = crystal; highlightBox.Visible = true
+                _currentDigKey = crystal
+                performDig(crystal, tier, sz)
+                _currentDigKey = nil
+              end
+            end
+            highlightBox.Visible = false
           end
         end
       end
@@ -863,8 +1028,9 @@ local function farmLoop()
 
     statusText = "Moving to "..tier.." ("..sz..")"
     highlightBox.Adornee = crystal; highlightBox.Visible = true
-    -- Extracted dig into a separate function to avoid register overflow in farmLoop
+    _currentDigKey = crystal
     performDig(crystal, tier, sz)
+    _currentDigKey = nil
     -- After dig, just continue to next iteration (highlightBox cleanup is inside performDig)
   end
 end
@@ -872,6 +1038,8 @@ end
 -- ══════════════════════════════════════════════════════════════
 --  UI LAYER — Axel Hub 1:1
 -- ══════════════════════════════════════════════════════════════
+
+local function buildUI()
 
 local BG       = Color3.fromRGB(17, 17, 24)
 local SIDEBAR  = Color3.fromRGB(13, 13, 19)
@@ -1099,7 +1267,11 @@ closeX2.Rotation = -45
 closeX2.ZIndex = 14
 closeX2.Parent = closeBtn
 
-closeBtn.Activated:Connect(function() farming = false; gui:Destroy() end)
+closeBtn.Activated:Connect(function()
+  pcall(function() saveAllSettings(farmRow and farmRow.get() or false) end)
+  farming = false
+  gui:Destroy()
+end)
 
 local function doMinimize()
   if minimized then return end
@@ -1113,13 +1285,11 @@ local function doMinimize()
   }):Play()
   delay(0.18, function() main.Visible = false end)
 
-  -- Show floating pill at saved position (top-left of original main)
+  -- Show pill at the same position as the header bar (no teleporting)
   if minimizedPill then
-    -- Pill anchored to wherever main's top-left corner is
-    minimizedPill.Position = UDim2.new(0, savedMainPos.X.Offset, 0, savedMainPos.Y.Offset)
+    minimizedPill.Position = savedMainPos
     minimizedPill.BackgroundTransparency = 1
     minimizedPill.Visible = true
-    -- Fade-in tween for pill
     tw:Create(minimizedPill, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
   end
 end
@@ -1273,12 +1443,12 @@ do
   end)
 end
 
--- ═══ MINIMIZED PILL (gold M + dark text pill, draggable, tap to restore) ═══
+-- ═══ MINIMIZED PILL (clone of header bar, draggable, tap to restore) ═══
 do
   local pill = Instance.new("TextButton")
   pill.Name = "MinimizedPill"
-  pill.Size = UDim2.new(0, 240, 0, 52)
-  pill.BackgroundColor3 = SIDEBAR
+  pill.Size = UDim2.new(0, 160, 0, 36)
+  pill.BackgroundColor3 = HEADER
   pill.BorderSizePixel = 0
   pill.Text = ""
   pill.AutoButtonColor = false
@@ -1286,51 +1456,51 @@ do
   pill.ZIndex = 100
   pill.Visible = false
   pill.Parent = gui
-  corner(pill, 26)  -- full pill rounding
+  corner(pill, 10)
 
-  -- Gold M-square on the LEFT
+  -- Gold M-square (same as header)
   local mSquare = Instance.new("Frame")
-  mSquare.Name = "MSquare"
-  mSquare.Size = UDim2.new(0, 40, 0, 40)
-  mSquare.Position = UDim2.new(0, 6, 0.5, -20)
+  mSquare.Size = UDim2.new(0, 24, 0, 24)
+  mSquare.Position = UDim2.new(0, 10, 0.5, -12)
   mSquare.BackgroundColor3 = ACCENT
   mSquare.BorderSizePixel = 0
   mSquare.ZIndex = 101
   mSquare.Parent = pill
-  corner(mSquare, 10)
+  corner(mSquare, 6)
 
   local mLetter = Instance.new("TextLabel")
   mLetter.Size = UDim2.new(1, 0, 1, 0)
   mLetter.BackgroundTransparency = 1
   mLetter.Text = "M"
   mLetter.TextColor3 = Color3.fromRGB(17, 17, 24)
-  mLetter.TextSize = 22
-  mLetter.Font = FB
+  mLetter.TextSize = 13
+  mLetter.Font = FT
   mLetter.TextYAlignment = Enum.TextYAlignment.Center
   mLetter.ZIndex = 102
   mLetter.Parent = mSquare
 
-  -- Hub name on the right of M
+  -- Hub name (same as header)
   local hubName = Instance.new("TextLabel")
-  hubName.Size = UDim2.new(0, 184, 0, 20)
-  hubName.Position = UDim2.new(0, 52, 0, 6)
+  hubName.Size = UDim2.new(0, 150, 0, 14)
+  hubName.Position = UDim2.new(0, 40, 0, 5)
   hubName.BackgroundTransparency = 1
   hubName.Text = "Sporplut's Hub"
   hubName.TextColor3 = TXT
-  hubName.TextSize = 14
-  hubName.Font = FB
+  hubName.TextSize = 12
+  hubName.Font = FT
   hubName.TextXAlignment = Enum.TextXAlignment.Left
   hubName.TextYAlignment = Enum.TextYAlignment.Center
   hubName.ZIndex = 101
   hubName.Parent = pill
 
+  -- Subtitle (same as header)
   local hubSub = Instance.new("TextLabel")
-  hubSub.Size = UDim2.new(0, 184, 0, 14)
-  hubSub.Position = UDim2.new(0, 52, 0, 28)
+  hubSub.Size = UDim2.new(0, 150, 0, 11)
+  hubSub.Position = UDim2.new(0, 40, 0, 20)
   hubSub.BackgroundTransparency = 1
   hubSub.Text = "by Sporplut"
   hubSub.TextColor3 = TXTMUTE
-  hubSub.TextSize = 11
+  hubSub.TextSize = 9
   hubSub.Font = FR
   hubSub.TextXAlignment = Enum.TextXAlignment.Left
   hubSub.TextYAlignment = Enum.TextYAlignment.Center
@@ -1353,6 +1523,9 @@ do
     if not minimized then return end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
       dragging = true
+      -- Snap to absolute pixel coords so drag math works (avoids Scale→Offset teleport)
+      local abs = minimizedPill.AbsolutePosition
+      minimizedPill.Position = UDim2.new(0, abs.X, 0, abs.Y)
       lastInputPos = input.Position
       dragDistance = 0
       wasDragged = false
@@ -2091,71 +2264,77 @@ refreshNewSizes()
 local optCard = card(pages.farm, 4)
 cardHeader(optCard, "OPTIONS", 1)
 local sellRow = toggleRow(optCard, "Auto Sell", "Sell when backpack is full", false, 2, function(v) sellOn = v end)
-toggleRow(optCard, "Smart Auto Sell", "Sell lesser crystals to mine higher-value ones", false, 3, function(v) smartSellOn = v end)
-
-local ctrlCard = card(pages.farm, 5)
-local startBtn, stopBtn
-startBtn = buttonRow(ctrlCard, "START FARMING", GREEN, 1, function()
-  if farming then return end
-  local anyR, anyS = false, false
-  for _, t in pairs(rarityTog) do if t.get() then anyR = true; break end end
-  for _, t in pairs(sizeTog) do if t.get() then anyS = true; break end end
-  if not anyR or not anyS then print("[Hub] Enable at least one rarity AND one size"); return end
-  farming = true; statsCrystals = 0; statsValue = 0; statsBombs = 0; statsStart = tick()
-  startBtn.Text = "RUNNING"; startBtn.BackgroundColor3 = CARD2
-  statusText = "Farming..."; print("[Hub] Farm started")
-  spawn(farmLoop)
-end)
-stopBtn = buttonRow(ctrlCard, "STOP", CARD2, 2, function()
-  if not farming then return end
-  farming = false
-  startBtn.Text = "START FARMING"; startBtn.BackgroundColor3 = GREEN
-  statusText = "Stopped"; print("[Hub] Farm stopped")
+local smartSellRow = toggleRow(optCard, "Smart Auto Sell", "Sell lesser crystals to mine higher-value ones", false, 3, function(v) smartSellOn = v end)
+local farmRow
+farmRow = toggleRow(optCard, "Auto Farm", "Start farming when toggled on", false, 4, function(v)
+  if v then
+    local anyR, anyS = false, false
+    for _, t in pairs(rarityTog) do if t.get() then anyR = true; break end end
+    for _, t in pairs(sizeTog) do if t.get() then anyS = true; break end end
+    if not anyR or not anyS then
+      print("[Hub] Enable at least one rarity AND one size")
+      farmRow.set(false)
+      return
+    end
+    farming = true; statsCrystals = 0; statsValue = 0; statsBombs = 0; statsStart = tick()
+    statusText = "Farming..."; print("[Hub] Farm started")
+    spawn(farmLoop)
+  else
+    if not farming then return end
+    farming = false
+    statusText = "Stopped"; print("[Hub] Farm stopped")
+    pcall(function() saveAllSettings(false) end)
+  end
 end)
 
 -- ══════════════════════════════════════════════════════════════
 --  BOMBS PAGE
 -- ══════════════════════════════════════════════════════════════
+-- Extracted into function to isolate upvalue captures from the chunk-level scope
+local abTog -- module-level so restore block can access it
+local function buildBombsPage()
+  pageTitle(pages.bomb, "Bombs", "Buy bombs & configure auto-detonation", 10)
 
-pageTitle(pages.bomb, "Bombs", "Buy bombs & configure auto-detonation", 10)
-
-local abCard = card(pages.bomb, 11)
-cardHeader(abCard, "AUTO-BOMB", 1)
-local abTog = toggleRow(abCard, "Auto-Bomb", "Detonate near crystals automatically", false, 2, function(v)
-  autoBombEnabled = v
-  if v then print("[Hub] Auto-bomb ON") else print("[Hub] Auto-bomb OFF") end
-end)
-
-local abBombOrder = {"ClassicBomb","WindBomb","IceBomb","FireBomb","ThunderBomb","PoisonBomb","TimeBomb","AgonyBomb"}
-local abBombNames = {}
-for _, bm in ipairs(bombs) do abBombNames[bm.id] = bm.name end
-local abRarities = {"Epic","Legendary","Mythic"}
-
-for i, rarity in ipairs(abRarities) do
-  local names = {}
-  for _, id in ipairs(abBombOrder) do table.insert(names, abBombNames[id]) end
-  local currentId = autoBombConfig[rarity]
-  local defaultIdx = 1
-  if currentId then for j, id in ipairs(abBombOrder) do if id == currentId then defaultIdx = j; break end end end
-  dropdownRow(abCard, rarity, "Bomb to use", names, defaultIdx, 2 + i, function(name, idx)
-    autoBombConfig[rarity] = abBombOrder[idx]
+  local abCard = card(pages.bomb, 11)
+  cardHeader(abCard, "AUTO-BOMB", 1)
+  abTog = toggleRow(abCard, "Auto-Bomb", "Detonate near crystals automatically", false, 2, function(v)
+    autoBombEnabled = v
+    if v then print("[Hub] Auto-bomb ON") else print("[Hub] Auto-bomb OFF") end
   end)
-end
 
-local shopCard = card(pages.bomb, 12)
-cardHeader(shopCard, "BOMB SHOP", 1)
+  local abBombOrder = {"ClassicBomb","WindBomb","IceBomb","FireBomb","ThunderBomb","PoisonBomb","TimeBomb","AgonyBomb"}
+  local abBombNames = {}
+  for _, bm in ipairs(bombs) do abBombNames[bm.id] = bm.name end
+  local abRarities = {"Epic","Legendary","Mythic"}
 
-local bombTog = {}
-local bombStk = {}
-for i, bm in ipairs(bombs) do
-  local row = toggleRow(shopCard, bm.name, "$"..fmtPrice(bm.price), false, i + 1, function(v) bombTogState[bm.id] = v end)
-  bombTog[bm.id] = row
-  local stkLbl = Instance.new("TextLabel")
-  stkLbl.Size = UDim2.new(0, 60, 0, 12); stkLbl.Position = UDim2.new(1, -100, 0, 28)
-  stkLbl.BackgroundTransparency = 1; stkLbl.Text = "Stock: --"; stkLbl.TextColor3 = TXTMUTE; stkLbl.TextSize = 10; stkLbl.Font = FC
-  stkLbl.TextXAlignment = Enum.TextXAlignment.Left; stkLbl.TextYAlignment = Enum.TextYAlignment.Center; stkLbl.ZIndex = 5; stkLbl.Parent = row.lbl.Parent
-  bombStk[bm.id] = stkLbl
+  for i, rarity in ipairs(abRarities) do
+    local names = {}
+    for _, id in ipairs(abBombOrder) do table.insert(names, abBombNames[id]) end
+    local currentId = autoBombConfig[rarity]
+    local defaultIdx = 1
+    if currentId then for j, id in ipairs(abBombOrder) do if id == currentId then defaultIdx = j; break end end end
+    dropdownRow(abCard, rarity, "Bomb to use", names, defaultIdx, 2 + i, function(name, idx)
+      autoBombConfig[rarity] = abBombOrder[idx]
+    end)
+  end
+
+  local shopCard = card(pages.bomb, 12)
+  cardHeader(shopCard, "BOMB SHOP", 1)
+
+  local bombTogBuilt = {}
+  local bombStkBuilt = {}
+  for i, bm in ipairs(bombs) do
+    local row = toggleRow(shopCard, bm.name, "$"..fmtPrice(bm.price), false, i + 1, function(v) bombTogState[bm.id] = v end)
+    bombTogBuilt[bm.id] = row
+    local stkLbl = Instance.new("TextLabel")
+    stkLbl.Size = UDim2.new(0, 60, 0, 12); stkLbl.Position = UDim2.new(1, -100, 0, 28)
+    stkLbl.BackgroundTransparency = 1; stkLbl.Text = "Stock: --"; stkLbl.TextColor3 = TXTMUTE; stkLbl.TextSize = 10; stkLbl.Font = FC
+    stkLbl.TextXAlignment = Enum.TextXAlignment.Left; stkLbl.TextYAlignment = Enum.TextYAlignment.Center; stkLbl.ZIndex = 5; stkLbl.Parent = row.lbl.Parent
+    bombStkBuilt[bm.id] = stkLbl
+  end
+  return bombTogBuilt, bombStkBuilt
 end
+local bombTog, bombStk = buildBombsPage()
 
 local function queryAndBuyBombs()
   if not BombShopQuery then return end
@@ -2196,24 +2375,36 @@ if BombShopRestocked then
   end)
 end
 
+-- Auto-pickup: event-based (zero-cost when no tools drop) + 2s fallback scan
+local function _tryPickupTool(obj)
+  if not obj:IsA("Tool") then return end
+  if not obj:FindFirstChild("Handle") then return end
+  local char = player.Character
+  local root = char and char:FindFirstChild("HumanoidRootPart")
+  if not root then return end
+  if (obj.Handle.Position - root.Position).Magnitude <= 18 then
+    pcall(function() CrystalDroppedPickup:FireServer(obj) end)
+  end
+end
+
+pcall(function()
+  workspace.DescendantAdded:Connect(function(obj)
+    if gui and gui.Parent then _tryPickupTool(obj) end
+  end)
+end)
+
 spawn(function()
   while gui and gui.Parent do
+    wait(2)
     local char = player.Character
-    if char then
-      local root = char:FindFirstChild("HumanoidRootPart")
-      if root and CrystalDroppedPickup then
-        -- Search workspace descendants (tools may be deep in hierarchy)
-        -- Aggressive: 18 studs range, scan every 0.3s
-        for _, obj in pairs(workspace:GetDescendants()) do
-          if obj:IsA("Tool") and obj:FindFirstChild("Handle") then
-            if (obj.Handle.Position - root.Position).Magnitude <= 18 then
-              pcall(function() CrystalDroppedPickup:FireServer(obj) end)
-            end
-          end
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root and CrystalDroppedPickup then
+      for _, obj in pairs(workspace:GetChildren()) do
+        if obj:IsA("Tool") and obj:FindFirstChild("Handle") then
+          _tryPickupTool(obj)
         end
       end
     end
-    wait(0.3)
   end
 end)
 
@@ -2250,13 +2441,33 @@ local hopRow = toggleRow(setCard, "Server Hop", "Hop after delay-seconds of low 
   if v then print("[Hub] Server hop ON") else print("[Hub] Server hop OFF") end
 end)
 -- Smart server-hop: slider for minimum qualifying value (in millions, with "M" suffix)
-sliderRow(setCard, "Hop Min Value", "Hop if all visible crystals combined < this", 1, 1000, 100, 4, function(val)
+local hopMinSlider = sliderRow(setCard, "Hop Min Value", "Hop if all visible crystals combined < this", 1, 1000, 100, 4, function(val)
   hopMinValue = math.floor(val * 1e6)
 end, "M")
 -- Server-hop countdown delay (seconds). User controls how long to wait before hopping.
-sliderRow(setCard, "Hop Delay", "Seconds to wait before teleporting (10-180)", 10, 180, 60, 5, function(val)
+local hopDelaySlider = sliderRow(setCard, "Hop Delay", "Seconds to wait before teleporting (10-180)", 10, 180, 60, 5, function(val)
   hopDelaySeconds = math.floor(val)
 end, "s")
+
+  return {statusVal=statusVal, bpVal=bpVal, farmCryst=farmCryst, farmValue=farmValue, farmBombs=farmBombs, farmElapsed=farmElapsed, refreshNewSizes=refreshNewSizes, farmRow=farmRow, sellRow=sellRow, smartSellRow=smartSellRow, rarityTog=rarityTog, sizeTog=sizeTog, hopRow=hopRow, arRow=arRow, hopMinSlider=hopMinSlider, hopDelaySlider=hopDelaySlider}
+end
+local ui = buildUI()
+local statusVal = ui.statusVal
+local bpVal = ui.bpVal
+local farmCryst = ui.farmCryst
+local farmValue = ui.farmValue
+local farmBombs = ui.farmBombs
+local farmElapsed = ui.farmElapsed
+local refreshNewSizes = ui.refreshNewSizes
+local farmRow = ui.farmRow
+local sellRow = ui.sellRow
+local smartSellRow = ui.smartSellRow
+local rarityTog = ui.rarityTog
+local sizeTog = ui.sizeTog
+local hopRow = ui.hopRow
+local arRow = ui.arRow
+local hopMinSlider = ui.hopMinSlider
+local hopDelaySlider = ui.hopDelaySlider
 
 -- ═══ Background loops ═══
 spawn(function()
@@ -2265,7 +2476,17 @@ spawn(function()
     statusVal.Text = statusText
     bpVal.Text = bpText
     farmCryst.Text = tostring(statsCrystals)
-    farmValue.Text = "$"..fmtPrice(statsValue)
+    if statsStart > 0 then
+      local elapsed = tick() - statsStart
+      if elapsed > 60 then
+        local rate = statsValue / (elapsed / 3600)
+        farmValue.Text = "$"..fmtPrice(statsValue).." ($"..fmtPrice(rate).."/hr)"
+      else
+        farmValue.Text = "$"..fmtPrice(statsValue)
+      end
+    else
+      farmValue.Text = "$"..fmtPrice(statsValue)
+    end
     farmBombs.Text = tostring(statsBombs)
     farmElapsed.Text = statsStart > 0 and string.format("%d:%02d", math.floor((tick() - statsStart)/60), math.floor((tick() - statsStart)%60)) or "0:00"
   end
@@ -2275,14 +2496,14 @@ spawn(function() while gui and gui.Parent do updateESP(); wait(2) end end)
 
 spawn(function()
   while gui and gui.Parent do
-    wait(1)
+    wait(3)
     if hopEnabled and farming then
       ensureCacheFresh()  -- periodic full rebuild safety net
 
-      -- Compute total value of all visible crystals on this server using CACHE (no full GetDescendants)
+      -- Compute total value of MINEABLE crystals only (exclude skipped/failed)
       local totalValue = 0
       for obj in pairs(_crystalCache) do
-        if obj and obj.Parent then
+        if obj and obj.Parent and not skippedCrystals[obj] and not failedCrystals[obj] then
           local tier = obj:GetAttribute("TierName")
           if tier and rarityTogState[tier] then
             local sz = obj:GetAttribute("SizeClass")
@@ -2292,26 +2513,77 @@ spawn(function()
           end
         end
       end
-      -- If total value is below user's threshold OR no crystals, consider hopping
-      local crystal = findBestCrystal()
-      if crystal and totalValue >= hopMinValue then
+      -- Hop if mineable crystal value is below user's threshold
+      if totalValue >= hopMinValue then
         hopTimer = 0
       else
-        hopTimer = hopTimer + 1
+        hopTimer = hopTimer + 3
         if hopTimer >= hopDelaySeconds then
           statusText = "Hopping server (low value $"..fmtPrice(totalValue)..")"
           print("[Hub] Server-hop: total value $"..fmtPrice(totalValue).." below $"..fmtPrice(hopMinValue))
           local TeleportService = game:GetService("TeleportService")
           local HttpService = game:GetService("HttpService")
-          local ok, servers = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"))
-          end)
-          if ok and servers and servers.data then
-            for _, s in ipairs(servers.data) do
-              if s.id ~= game.JobId and s.playing < s.maxPlayers then
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, s.id, player); break
+          -- Fetch all servers with pagination
+          local allServers = {}
+          local cursor = ""
+          for page = 1, 10 do
+            local url = "https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Desc&limit=100"
+            if cursor ~= "" then url = url.."&cursor="..cursor end
+            local pok, pageData = pcall(function()
+              return HttpService:JSONDecode(game:HttpGet(url))
+            end)
+            if pok and pageData and pageData.data then
+              for _, s in ipairs(pageData.data) do
+                allServers[#allServers+1] = s
+              end
+              cursor = pageData.nextPageCursor or ""
+              if cursor == "" then break end
+            else
+              break
+            end
+          end
+          if #allServers > 0 then
+            local now = tick()
+            local minPlayers = 3
+            -- First pass: try >= 3 players
+            local candidates = {}
+            for _, s in ipairs(allServers) do
+              if s.id ~= game.JobId and s.playing < s.maxPlayers and s.playing >= minPlayers then
+                local visited = visitedServers[s.id]
+                if not visited or now - visited >= VISIT_COOLDOWN then
+                  candidates[#candidates+1] = s
+                end
               end
             end
+            -- Fallback: if no candidates with 3+, try any server with 1+ player
+            if #candidates == 0 then
+              minPlayers = 1
+              visitedServers = {}
+              for _, s in ipairs(allServers) do
+                if s.id ~= game.JobId and s.playing < s.maxPlayers and s.playing >= minPlayers then
+                  candidates[#candidates+1] = s
+                end
+              end
+            end
+            table.sort(candidates, function(a, b) return a.playing > b.playing end)
+            local pickCount = math.min(#candidates, 5)
+            if pickCount > 0 then
+              local pick = candidates[math.random(1, pickCount)]
+              visitedServers[pick.id] = tick()
+              -- Save settings to disk for restoration on new server
+              pcall(function() saveAllSettings(true) end)
+              print("[Hub] Hopping to server with "..pick.playing.."/"..pick.maxPlayers.." players (min: "..minPlayers..")")
+              local hopOk, hopErr = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.id, player) end)
+              if not hopOk then
+                print("[Hub] TeleportToPlaceInstance failed: "..tostring(hopErr)..", trying Teleport fallback")
+                local hopOk2, hopErr2 = pcall(function() TeleportService:Teleport(game.PlaceId, player) end)
+                if not hopOk2 then print("[Hub] Teleport fallback also failed: "..tostring(hopErr2)) end
+              end
+            else
+              print("[Hub] Server-hop: no valid candidates found ("..#allServers.." servers scanned)")
+            end
+          else
+            print("[Hub] Server-hop: HTTP failed or no servers returned")
           end
           hopTimer = 0
         end
@@ -2329,6 +2601,118 @@ spawn(function()
 end)
 
 -- Sizes: known list pre-created at init (default ON), new size classes auto-add during session (default ON, user choices preserved)
-spawn(function() while gui and gui.Parent do wait(3); pcall(refreshNewSizes) end end)
+spawn(function() while gui and gui.Parent do wait(10); pcall(refreshNewSizes) end end)
+
+-- Centralized save — called by auto-save, STOP, close, and server-hop
+local function saveAllSettings(farmingState)
+  pcall(function()
+    local t = {}
+    t[#t+1] = "farming="..tostring(farmingState)
+    t[#t+1] = "sellOn="..tostring(sellOn)
+    t[#t+1] = "smartSellOn="..tostring(smartSellOn)
+    t[#t+1] = "autoBombEnabled="..tostring(autoBombEnabled)
+    t[#t+1] = "hopEnabled="..tostring(hopEnabled)
+    t[#t+1] = "hopMinValue="..tostring(hopMinValue)
+    t[#t+1] = "hopDelaySeconds="..tostring(hopDelaySeconds)
+    t[#t+1] = "antiRagdollEnabled="..tostring(antiRagdollEnabled)
+    for k, v in pairs(rarityTogState) do t[#t+1] = "r_"..k.."="..tostring(v) end
+    for k, v in pairs(sizeTogState) do t[#t+1] = "s_"..k.."="..tostring(v) end
+    for k, v in pairs(bombTogState) do t[#t+1] = "b_"..k.."="..tostring(v) end
+    writefile("sporplut_hub_settings.txt", table.concat(t, "\n"))
+  end)
+end
+
+-- Auto-save settings every 5 seconds (always, not just while farming)
+spawn(function()
+  while gui and gui.Parent do
+    wait(5)
+    pcall(function() saveAllSettings(farming) end)
+  end
+end)
+
+-- Restore settings from disk
+do
+  local ok, raw = pcall(function() return readfile("sporplut_hub_settings.txt") end)
+  if ok and raw and raw ~= "" then
+    local data = {}
+    for line in raw:gmatch("[^\n]+") do
+      local k, v = line:match("^(.-)=(.*)$")
+      if k then data[k] = v end
+    end
+    print("[Hub] Restore: found file, farming="..tostring(data.farming))
+
+    -- Apply all state first, then visuals after a tiny delay
+    local function applyVisuals()
+      -- Restore rarity toggles + visuals
+      for k, v in pairs(data) do
+        if k:sub(1,2) == "r_" then
+          local name = k:sub(3)
+          rarityTogState[name] = (v == "true")
+          pcall(function() rarityTog[name].set(v == "true") end)
+        elseif k:sub(1,2) == "s_" then
+          local name = k:sub(3)
+          sizeTogState[name] = (v == "true")
+          pcall(function() sizeTog[name].set(v == "true") end)
+        elseif k:sub(1,2) == "b_" then
+          local name = k:sub(3)
+          bombTogState[name] = (v == "true")
+          pcall(function() bombTog[name].set(v == "true") end)
+        end
+      end
+
+      -- Restore main toggle states + visuals
+      sellOn = (data.sellOn == "true")
+      pcall(function() sellRow.set(sellOn) end)
+
+      smartSellOn = (data.smartSellOn == "true")
+      pcall(function() smartSellRow.set(smartSellOn) end)
+
+      autoBombEnabled = (data.autoBombEnabled == "true")
+      pcall(function() abTog.set(autoBombEnabled) end)
+
+      hopEnabled = (data.hopEnabled == "true")
+      pcall(function() hopRow.set(hopEnabled) end)
+
+      hopMinValue = tonumber(data.hopMinValue) or 100000000
+      pcall(function() hopMinSlider.set(math.floor(hopMinValue / 1e6)) end)
+
+      hopDelaySeconds = tonumber(data.hopDelaySeconds) or 60
+      pcall(function() hopDelaySlider.set(hopDelaySeconds) end)
+
+      -- Anti-ragdoll
+      antiRagdollEnabled = (data.antiRagdollEnabled == "true")
+      if antiRagdollEnabled then
+        pcall(applyAntiRagdoll)
+        pcall(function() arRow.set(true); arRow.lbl.TextColor3 = GREEN end)
+      end
+
+      -- Farming toggle visual
+      if data.farming == "true" then
+        pcall(function() farmRow.set(true) end)
+      end
+
+      print("[Hub] All toggle visuals restored")
+    end
+
+    -- Set variable states immediately, visuals after tiny delay
+    antiRagdollEnabled = (data.antiRagdollEnabled == "true")
+    hopMinValue = tonumber(data.hopMinValue) or 100000000
+    hopDelaySeconds = tonumber(data.hopDelaySeconds) or 60
+
+    delay(0.1, applyVisuals)
+
+    -- If farming was on when saved, resume
+    if data.farming == "true" then
+      farming = true; statsCrystals = 0; statsValue = 0; statsBombs = 0; statsStart = tick()
+      statusText = "Farming... (restored after hop)"
+      print("[Hub] Settings restored — resuming farm")
+      spawn(farmLoop)
+    else
+      print("[Hub] Settings restored (farming off)")
+    end
+  else
+    print("[Hub] No settings file")
+  end
+end
 
 print("[Hub] Ready — Mine Hub v7 (Axel Hub 1:1)")
